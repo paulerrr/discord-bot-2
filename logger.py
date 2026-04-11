@@ -16,14 +16,15 @@ load_dotenv()
 # ── Config ────────────────────────────────────────────────────────────────────
 TOKEN = os.environ["DISCORD_TOKEN"]
 
-# Set to a list of channel IDs to only log those channels, or empty to log all.
-WATCHED_CHANNELS: list[int] = []
+# Comma-separated guild IDs to watch, or empty to watch all guilds.
+WATCHED_GUILDS: list[int] = [
+    int(g) for g in os.environ.get("WATCHED_GUILDS", "").split(",") if g.strip()
+]
 
-# Set to a list of guild IDs to only log those guilds, or empty to log all.
-WATCHED_GUILDS: list[int] = []
-
-# Save media attachments to disk.
-SAVE_ATTACHMENTS = True
+# Optional channel ID to mirror log entries into Discord.
+LOG_CHANNEL_ID: int | None = (
+    int(os.environ["LOG_CHANNEL_ID"]) if os.environ.get("LOG_CHANNEL_ID") else None
+)
 
 BASE_LOG_DIR = Path("logs")
 MEDIA_DIR = Path("media")
@@ -95,8 +96,6 @@ class CachedMessage:
 def _is_watched(message: discord.Message) -> bool:
     if WATCHED_GUILDS and (not message.guild or message.guild.id not in WATCHED_GUILDS):
         return False
-    if WATCHED_CHANNELS and message.channel.id not in WATCHED_CHANNELS:
-        return False
     return True
 
 
@@ -122,12 +121,10 @@ async def _save_attachment(session: aiohttp.ClientSession,
 
 class MessageLogger(discord.Client):
     def __init__(self) -> None:
-        # message_content intent is required to read content
-        intents = discord.Intents.default()
-        intents.message_content = True
-        super().__init__(intents=intents)
+        super().__init__()
         self._session: aiohttp.ClientSession | None = None
         self._db: aiosqlite.Connection | None = None
+        self._log_channel: discord.TextChannel | None = None
 
     async def setup_hook(self) -> None:
         self._session = aiohttp.ClientSession()
@@ -201,12 +198,29 @@ class MessageLogger(discord.Client):
 
     # ── Events ────────────────────────────────────────────────────────────────
 
+    async def _log_to_channel(self, text: str, files: list[discord.File] | None = None) -> None:
+        if self._log_channel is None:
+            return
+        try:
+            await self._log_channel.send(text, files=files or [])
+        except Exception as exc:
+            console.warning("Failed to send to log channel: %s", exc)
+
     async def on_ready(self) -> None:
         console.info("Logged in as %s (id: %s)", self.user, self.user.id)
         console.info("Watching %d guilds", len(self.guilds))
+        if LOG_CHANNEL_ID:
+            ch = self.get_channel(LOG_CHANNEL_ID)
+            if isinstance(ch, discord.TextChannel):
+                self._log_channel = ch
+                console.info("Log channel: #%s (%s)", ch.name, ch.id)
+            else:
+                console.warning("LOG_CHANNEL_ID %s not found or not a text channel", LOG_CHANNEL_ID)
 
     async def on_message(self, message: discord.Message) -> None:
         if not _is_watched(message):
+            return
+        if self._log_channel and message.channel.id == self._log_channel.id:
             return
 
         await self._cache_message(message)
@@ -223,14 +237,10 @@ class MessageLogger(discord.Client):
 
         if message.attachments:
             lines.append(f"  Attachments: {len(message.attachments)}\n")
-            if SAVE_ATTACHMENTS and self._session:
-                for att in message.attachments:
-                    saved = await _save_attachment(self._session, message, att)
-                    label = str(saved) if saved else att.url
-                    lines.append(f"    - {att.filename}  →  {label}\n")
-            else:
-                for att in message.attachments:
-                    lines.append(f"    - {att.filename}  ({att.url})\n")
+            for att in message.attachments:
+                saved = await _save_attachment(self._session, message, att)
+                local = f"  →  {saved}" if saved else ""
+                lines.append(f"    - {att.filename}  ({att.url}){local}\n")
 
         if message.embeds:
             lines.append(f"  Embeds: {len(message.embeds)}\n")
@@ -242,6 +252,8 @@ class MessageLogger(discord.Client):
                                before: discord.Message,
                                after: discord.Message) -> None:
         if not _is_watched(after):
+            return
+        if self._log_channel and after.channel.id == self._log_channel.id:
             return
         if before.content == after.content:
             return  # pin, embed-load, etc. — not a real edit
@@ -259,6 +271,21 @@ class MessageLogger(discord.Client):
             f"  AFTER:  {after.content}\n\n"
         )
         _write(path, text)
+        guild_dir = MEDIA_DIR / (str(after.guild.id) if after.guild else "DMs")
+        files = [
+            discord.File(p)
+            for att in before.attachments
+            if (p := guild_dir / f"{before.id}_{att.filename}").exists()
+        ]
+        edited_ts = int((after.edited_at or datetime.now(timezone.utc)).timestamp())
+        channel_post = (
+            f"✏️ **Message Edited**  ·  {_channel_label(after)}"
+            + (f"  ·  {after.guild.name}" if after.guild else "")
+            + f"\n**Author:** {discord.utils.escape_markdown(str(after.author))} (`{after.author.id}`)  ·  <t:{edited_ts}:R>"
+            f"\n**Before:**\n>>> {discord.utils.escape_markdown(before.content)}"
+            f"\n**After:**\n>>> {discord.utils.escape_markdown(after.content)}"
+        )
+        await self._log_to_channel(channel_post, files=files)
         console.info("Edit logged: %s in %s", after.author, _channel_label(after))
 
     async def on_message_delete(self, message: discord.Message) -> None:
@@ -299,6 +326,23 @@ class MessageLogger(discord.Client):
 
         lines.append("\n")
         _write(path, "".join(lines))
+        guild_dir = MEDIA_DIR / (str(message.guild.id) if message.guild else "DMs")
+        files = [
+            discord.File(p)
+            for att in cached.attachments
+            if (p := guild_dir / f"{cached.id}_{att['filename']}").exists()
+        ]
+        sent_ts = int(cached.created_at.timestamp())
+        channel_post = (
+            f"🗑️ **Message Deleted**  ·  {channel_label}"
+            + (f"  ·  {cached.guild_name}" if cached.guild_name else "")
+            + f"\n**Author:** {discord.utils.escape_markdown(cached.author)} (`{cached.author_id}`)  ·  sent <t:{sent_ts}:R>"
+            + f"\n**Content:** {discord.utils.escape_markdown(cached.content) if cached.content else '*<no text>*'}"
+        )
+        if cached.attachments:
+            att_list = "  ".join(f"`{a['filename']}`" for a in cached.attachments)
+            channel_post += f"\n📎 {att_list}"
+        await self._log_to_channel(channel_post, files=files)
         console.info("Delete logged: %s in %s", cached.author, channel_label)
 
     async def on_bulk_message_delete(self,
@@ -319,6 +363,14 @@ class MessageLogger(discord.Client):
                     f"  Content: {content}\n\n"
                 )
                 _write(path, text)
+                sent_ts = int(message.created_at.timestamp())
+                channel_post = (
+                    f"🗑️ **Bulk Delete**  ·  {channel_label}"
+                    + (f"  ·  {guild_name}" if guild_name else "")
+                    + f"\n**Author:** {discord.utils.escape_markdown(str(message.author))} (`{message.author.id}`)  ·  sent <t:{sent_ts}:R>"
+                    + f"\n**Content:** {discord.utils.escape_markdown(content) if content != '<unknown>' else '*<unknown>*'}"
+                )
+                await self._log_to_channel(channel_post)
 
         console.info("Bulk delete: %d messages", len(messages))
 
