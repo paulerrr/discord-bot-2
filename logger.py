@@ -1,9 +1,12 @@
 import discord
 import asyncio
 import os
+import json
 import aiohttp
+import aiosqlite
 import logging
 import logging.handlers
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
@@ -77,6 +80,18 @@ def _write(path: Path, text: str) -> None:
         f.write(text)
 
 
+@dataclass
+class CachedMessage:
+    id: int
+    author: str
+    author_id: int
+    channel: str
+    guild_name: str | None
+    content: str
+    created_at: datetime
+    attachments: list[dict]  # [{filename, url}, ...]
+
+
 def _is_watched(message: discord.Message) -> bool:
     if WATCHED_GUILDS and (not message.guild or message.guild.id not in WATCHED_GUILDS):
         return False
@@ -111,17 +126,78 @@ class MessageLogger(discord.Client):
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(intents=intents)
-        # Cache messages so we can log edits / deletes when Discord omits content
-        self._msg_cache: dict[int, discord.Message] = {}
         self._session: aiohttp.ClientSession | None = None
+        self._db: aiosqlite.Connection | None = None
 
     async def setup_hook(self) -> None:
         self._session = aiohttp.ClientSession()
+        self._db = await aiosqlite.connect("cache.db")
+        await self._db.execute("PRAGMA journal_mode=WAL")
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id          INTEGER PRIMARY KEY,
+                author      TEXT    NOT NULL,
+                author_id   INTEGER NOT NULL,
+                channel     TEXT    NOT NULL,
+                guild_name  TEXT,
+                content     TEXT,
+                created_at  TEXT    NOT NULL,
+                attachments TEXT
+            )
+        """)
+        await self._db.commit()
 
     async def close(self) -> None:
         if self._session:
             await self._session.close()
+        if self._db:
+            await self._db.close()
         await super().close()
+
+    async def _cache_message(self, message: discord.Message) -> None:
+        if not self._db:
+            return
+        attachments = json.dumps([
+            {"filename": a.filename, "url": a.url} for a in message.attachments
+        ])
+        await self._db.execute(
+            """INSERT OR REPLACE INTO messages
+               (id, author, author_id, channel, guild_name, content, created_at, attachments)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                message.id,
+                str(message.author),
+                message.author.id,
+                str(message.channel),
+                message.guild.name if message.guild else None,
+                message.content,
+                message.created_at.isoformat(),
+                attachments,
+            ),
+        )
+        await self._db.commit()
+
+    async def _pop_cached(self, message_id: int) -> CachedMessage | None:
+        if not self._db:
+            return None
+        async with self._db.execute(
+            "SELECT id, author, author_id, channel, guild_name, content, created_at, attachments "
+            "FROM messages WHERE id = ?",
+            (message_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if not row:
+            return None
+        return CachedMessage(
+            id=row[0],
+            author=row[1],
+            author_id=row[2],
+            channel=row[3],
+            guild_name=row[4],
+            content=row[5] or "",
+            created_at=datetime.fromisoformat(row[6]),
+            attachments=json.loads(row[7]) if row[7] else [],
+        )
 
     # ── Events ────────────────────────────────────────────────────────────────
 
@@ -133,7 +209,7 @@ class MessageLogger(discord.Client):
         if not _is_watched(message):
             return
 
-        self._msg_cache[message.id] = message
+        await self._cache_message(message)
 
         date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         path = _log_path(_guild_name(message), str(message.channel), date)
@@ -170,7 +246,7 @@ class MessageLogger(discord.Client):
         if before.content == after.content:
             return  # pin, embed-load, etc. — not a real edit
 
-        self._msg_cache[after.id] = after
+        await self._cache_message(after)
 
         date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         path = _log_path(_guild_name(after), str(after.channel), date)
@@ -189,14 +265,27 @@ class MessageLogger(discord.Client):
         if not _is_watched(message):
             return
 
-        cached = self._msg_cache.pop(message.id, message)
+        cached = await self._pop_cached(message.id)
+        if cached is None:
+            cached = CachedMessage(
+                id=message.id,
+                author=str(message.author),
+                author_id=message.author.id,
+                channel=str(message.channel),
+                guild_name=message.guild.name if message.guild else None,
+                content=message.content,
+                created_at=message.created_at,
+                attachments=[{"filename": a.filename, "url": a.url} for a in message.attachments],
+            )
+
+        channel_label = f"#{cached.channel}" if cached.guild_name else f"DM:{cached.channel}"
         date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        path = _log_path(_guild_name(cached), str(cached.channel), date)
+        path = _log_path(cached.guild_name, cached.channel, date)
 
         lines: list[str] = [
             f"[{_format_ts(datetime.now(timezone.utc))}] "
-            f"[DELETE] {cached.author} ({cached.author.id}) "
-            f"in {_channel_label(cached)}\n"
+            f"[DELETE] {cached.author} ({cached.author_id}) "
+            f"in {channel_label}\n"
             f"  Originally sent: {_format_ts(cached.created_at)}\n",
             f"  Content: {cached.content}\n" if cached.content else "  Content: <unknown>\n",
         ]
@@ -204,24 +293,30 @@ class MessageLogger(discord.Client):
         if cached.attachments:
             lines.append(f"  Attachments ({len(cached.attachments)}):\n")
             for att in cached.attachments:
-                lines.append(f"    - {att.filename}\n")
+                local = MEDIA_DIR / (str(message.guild.id) if message.guild else "DMs") / f"{cached.id}_{att['filename']}"
+                label = str(local) if local.exists() else att['url']
+                lines.append(f"    - {att['filename']}  →  {label}\n")
 
         lines.append("\n")
         _write(path, "".join(lines))
-        console.info("Delete logged: %s in %s", cached.author, _channel_label(cached))
+        console.info("Delete logged: %s in %s", cached.author, channel_label)
 
     async def on_bulk_message_delete(self,
                                       messages: list[discord.Message]) -> None:
         for message in messages:
             if _is_watched(message):
-                self._msg_cache.pop(message.id, None)
+                cached = await self._pop_cached(message.id)
+                guild_name = message.guild.name if message.guild else None
+                channel_str = str(message.channel)
+                channel_label = f"#{channel_str}" if guild_name else f"DM:{channel_str}"
+                content = cached.content if cached else (message.content or "<unknown>")
                 date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                path = _log_path(_guild_name(message), str(message.channel), date)
+                path = _log_path(guild_name, channel_str, date)
                 text = (
                     f"[{_format_ts(datetime.now(timezone.utc))}] "
                     f"[BULK-DELETE] {message.author} ({message.author.id}) "
-                    f"in {_channel_label(message)}\n"
-                    f"  Content: {message.content or '<unknown>'}\n\n"
+                    f"in {channel_label}\n"
+                    f"  Content: {content}\n\n"
                 )
                 _write(path, text)
 

@@ -1,3 +1,4 @@
 discord.py-self
 aiohttp
+aiosqlite
 python-dotenv
