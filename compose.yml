@@ -1,0 +1,9 @@
+services:
+  message-logger:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./logs:/app/logs
+      - ./media:/app/media
+      - ./cache.db:/app/cache.db

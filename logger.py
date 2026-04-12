@@ -110,6 +110,11 @@ _guild_owner: dict[int, int] = {}  # guild_id → id(client)
 # This may differ from the guild owner if that account lacks channel access.
 _log_poster: "MessageLogger | None" = None
 
+# Serialises all log-channel posts; prevents burst rate-limit exposure.
+_post_queue: asyncio.Queue[tuple[str, list]] = asyncio.Queue()
+# Caps concurrent media downloads.
+_download_sem = asyncio.Semaphore(5)
+
 
 def _is_watched(message: discord.Message, client_id: int) -> bool:
     if WATCHED_GUILDS and (not message.guild or message.guild.id not in WATCHED_GUILDS):
@@ -117,6 +122,28 @@ def _is_watched(message: discord.Message, client_id: int) -> bool:
     if message.guild and _guild_owner.get(message.guild.id) != client_id:
         return False
     return True
+
+
+async def _post_worker() -> None:
+    """Single consumer for log-channel posts; retries with exponential backoff."""
+    while True:
+        text, files = await _post_queue.get()
+        try:
+            if _log_poster is not None:
+                delay = 1.0
+                for attempt in range(5):
+                    try:
+                        await _log_poster._send_chunked(text, files)
+                        break
+                    except Exception as exc:
+                        console.warning(
+                            "Log channel post failed (attempt %d/5): %s", attempt + 1, exc
+                        )
+                        if attempt < 4:
+                            await asyncio.sleep(delay)
+                            delay = min(delay * 2, 30.0)
+        finally:
+            _post_queue.task_done()
 
 
 async def _save_attachment(session: aiohttp.ClientSession,
@@ -128,10 +155,11 @@ async def _save_attachment(session: aiohttp.ClientSession,
     if dest.exists():
         return dest
     try:
-        async with session.get(attachment.url) as resp:
-            if resp.status == 200:
-                dest.write_bytes(await resp.read())
-                return dest
+        async with _download_sem:
+            async with session.get(attachment.url) as resp:
+                if resp.status == 200:
+                    dest.write_bytes(await resp.read())
+                    return dest
     except Exception as exc:
         console.warning("Failed to save attachment %s: %s", attachment.filename, exc)
     return None
@@ -149,10 +177,11 @@ async def _save_sticker(session: aiohttp.ClientSession,
     if dest.exists():
         return dest
     try:
-        async with session.get(sticker.url) as resp:
-            if resp.status == 200:
-                dest.write_bytes(await resp.read())
-                return dest
+        async with _download_sem:
+            async with session.get(sticker.url) as resp:
+                if resp.status == 200:
+                    dest.write_bytes(await resp.read())
+                    return dest
     except Exception as exc:
         console.warning("Failed to save sticker %s: %s", sticker.name, exc)
     return None
@@ -223,7 +252,8 @@ class MessageLogger(discord.Client):
 
     # ── Events ────────────────────────────────────────────────────────────────
 
-    async def _log_to_channel(self, text: str, files: list[discord.File] | None = None) -> None:
+    async def _send_chunked(self, text: str, files: list[discord.File]) -> None:
+        """Send text to the log channel, splitting at Discord's 2000-char limit."""
         if self._log_channel is None:
             return
         chunks: list[str] = []
@@ -236,14 +266,15 @@ class MessageLogger(discord.Client):
                 split_at = 2000
             chunks.append(text[:split_at])
             text = text[split_at:].lstrip("\n")
-        try:
-            for i, chunk in enumerate(chunks):
-                await self._log_channel.send(
-                    chunk,
-                    files=(files or []) if i == len(chunks) - 1 else [],
-                )
-        except Exception as exc:
-            console.warning("Failed to send to log channel: %s", exc)
+        for i, chunk in enumerate(chunks):
+            await self._log_channel.send(
+                chunk,
+                files=files if i == len(chunks) - 1 else [],
+            )
+
+    async def _log_to_channel(self, text: str, files: list[discord.File] | None = None) -> None:
+        """Enqueue a post; _post_worker sends it sequentially with retry."""
+        await _post_queue.put((text, files or []))
 
     async def on_ready(self) -> None:
         global _log_poster
@@ -337,7 +368,7 @@ class MessageLogger(discord.Client):
             f"Before: {discord.utils.escape_markdown(before.content)}",
             f"After: {discord.utils.escape_markdown(after.content)}",
         ])
-        await (_log_poster or self)._log_to_channel(channel_post, files=files)
+        await self._log_to_channel(channel_post, files=files)
         console.info("Edit logged: %s in %s", after.author, _channel_label(after))
 
     async def on_message_delete(self, message: discord.Message) -> None:
@@ -408,45 +439,61 @@ class MessageLogger(discord.Client):
         if cached.stickers:
             post_lines.append("Stickers: " + "  ".join(s['name'] for s in cached.stickers))
         channel_post = "\n".join(post_lines)
-        await (_log_poster or self)._log_to_channel(channel_post, files=files)
+        await self._log_to_channel(channel_post, files=files)
         console.info("Delete logged: %s in %s", cached.author, channel_label)
 
     async def on_bulk_message_delete(self,
                                       messages: list[discord.Message]) -> None:
-        for message in messages:
-            if _is_watched(message, id(self)):
-                cached = await self._pop_cached(message.id)
-                guild_name = message.guild.name if message.guild else None
-                channel_str = str(message.channel)
-                channel_label = f"#{channel_str}" if guild_name else f"DM:{channel_str}"
-                content = cached.content if cached else (message.content or "<unknown>")
-                stickers = cached.stickers if cached else [{"id": s.id, "name": s.name, "format": s.format.name} for s in message.stickers]
-                date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                path = _log_path(guild_name, channel_str, date)
-                log_lines = [
-                    f"[{_format_ts(datetime.now(timezone.utc))}] "
-                    f"[BULK-DELETE] {message.author} ({message.author.id}) "
-                    f"in {channel_label}\n",
-                    f"  Content: {content}\n",
-                ]
-                if stickers:
-                    log_lines.append(f"  Stickers ({len(stickers)}): " + ", ".join(s['name'] for s in stickers) + "\n")
-                log_lines.append("\n")
-                _write(path, "".join(log_lines))
-                sent_ts = int(message.created_at.timestamp())
-                post_lines = [
-                    f"🗑️ Bulk Delete",
-                    f"Channel: {channel_label}" + (f"  ·  {guild_name}" if guild_name else ""),
-                    f"Author: {discord.utils.escape_markdown(str(message.author))} ({message.author.id})",
-                    f"Sent: <t:{sent_ts}:R>",
-                    f"Content: {discord.utils.escape_markdown(content) if content != '<unknown>' else '<unknown>'}",
-                ]
-                if stickers:
-                    post_lines.append("Stickers: " + "  ".join(s['name'] for s in stickers))
-                channel_post = "\n".join(post_lines)
-                await (_log_poster or self)._log_to_channel(channel_post)
+        watched = [m for m in messages if _is_watched(m, id(self))]
+        if not watched:
+            return
 
-        console.info("Bulk delete: %d messages", len(messages))
+        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        entries: list[tuple] = []
+
+        for message in watched:
+            cached = await self._pop_cached(message.id)
+            guild_name = message.guild.name if message.guild else None
+            channel_str = str(message.channel)
+            channel_label = f"#{channel_str}" if guild_name else f"DM:{channel_str}"
+            content = cached.content if cached else (message.content or "<unknown>")
+            stickers = cached.stickers if cached else [
+                {"id": s.id, "name": s.name, "format": s.format.name}
+                for s in message.stickers
+            ]
+            entries.append((message, guild_name, channel_label, content, stickers))
+            path = _log_path(guild_name, channel_str, date)
+            log_lines = [
+                f"[{_format_ts(datetime.now(timezone.utc))}] "
+                f"[BULK-DELETE] {message.author} ({message.author.id}) "
+                f"in {channel_label}\n",
+                f"  Content: {content}\n",
+            ]
+            if stickers:
+                log_lines.append(
+                    f"  Stickers ({len(stickers)}): "
+                    + ", ".join(s["name"] for s in stickers) + "\n"
+                )
+            log_lines.append("\n")
+            _write(path, "".join(log_lines))
+
+        # One summary post instead of N individual posts.
+        first_msg, first_guild, first_ch_label, _, _ = entries[0]
+        post_lines = [
+            f"🗑️ Bulk Delete ({len(watched)} messages)",
+            f"Channel: {first_ch_label}" + (f"  ·  {first_guild}" if first_guild else ""),
+        ]
+        MAX_PREVIEW = 10
+        for msg, _, _, content, _ in entries[:MAX_PREVIEW]:
+            author = discord.utils.escape_markdown(str(msg.author))
+            preview = discord.utils.escape_markdown(content[:80])
+            if len(content) > 80:
+                preview += "…"
+            post_lines.append(f"  {author}: {preview}")
+        if len(entries) > MAX_PREVIEW:
+            post_lines.append(f"  [+ {len(entries) - MAX_PREVIEW} more]")
+        await self._log_to_channel("\n".join(post_lines))
+        console.info("Bulk delete: %d messages", len(watched))
 
     async def on_error(self, event: str, *args, **kwargs) -> None:  # type: ignore[override]
         import traceback
@@ -458,6 +505,7 @@ class MessageLogger(discord.Client):
 async def main() -> None:
     console.info("Starting %d account(s)", len(TOKENS))
 
+    worker = asyncio.create_task(_post_worker(), name="log-poster")
     db = await aiosqlite.connect("cache.db")
     await db.execute("PRAGMA journal_mode=WAL")
     await db.execute("""
@@ -484,6 +532,11 @@ async def main() -> None:
     finally:
         await asyncio.gather(*[client.close() for client in clients])
         await db.close()
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":

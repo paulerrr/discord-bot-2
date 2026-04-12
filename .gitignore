@@ -1,5 +1,6 @@
 .env
 logs/
 media/
+cache.db
 __pycache__/
 *.pyc
