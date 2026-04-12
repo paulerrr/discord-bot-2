@@ -34,6 +34,10 @@ LOG_CHANNEL_ID: int | None = (
     int(os.environ["LOG_CHANNEL_ID"]) if os.environ.get("LOG_CHANNEL_ID") else None
 )
 
+# Optional dedicated token whose sole job is posting to LOG_CHANNEL_ID.
+# This account does not need to be in any WATCHED_GUILDS.
+LOG_POSTER_TOKEN: str | None = os.environ.get("LOG_POSTER_TOKEN", "").strip() or None
+
 BASE_LOG_DIR = Path("logs")
 MEDIA_DIR = Path("media")
 # ─────────────────────────────────────────────────────────────────────────────
@@ -116,12 +120,6 @@ _post_queue: asyncio.Queue[tuple[str, list]] = asyncio.Queue()
 _download_sem = asyncio.Semaphore(5)
 
 
-def _is_watched(message: discord.Message, client_id: int) -> bool:
-    if WATCHED_GUILDS and (not message.guild or message.guild.id not in WATCHED_GUILDS):
-        return False
-    if message.guild and _guild_owner.get(message.guild.id) != client_id:
-        return False
-    return True
 
 
 async def _post_worker() -> None:
@@ -190,11 +188,21 @@ async def _save_sticker(session: aiohttp.ClientSession,
 # ── Client ────────────────────────────────────────────────────────────────────
 
 class MessageLogger(discord.Client):
-    def __init__(self, db: aiosqlite.Connection) -> None:
+    def __init__(self, db: aiosqlite.Connection, poster_only: bool = False) -> None:
         super().__init__()
         self._db = db
+        self._poster_only = poster_only
         self._session: aiohttp.ClientSession | None = None
         self._log_channel: discord.TextChannel | None = None
+
+    def _is_watched(self, message: discord.Message) -> bool:
+        if self._poster_only:
+            return False
+        if WATCHED_GUILDS and (not message.guild or message.guild.id not in WATCHED_GUILDS):
+            return False
+        if message.guild and _guild_owner.get(message.guild.id) != id(self):
+            return False
+        return True
 
     async def setup_hook(self) -> None:
         self._session = aiohttp.ClientSession()
@@ -279,6 +287,14 @@ class MessageLogger(discord.Client):
     async def on_ready(self) -> None:
         global _log_poster
         console.info("Logged in as %s (id: %s)", self.user, self.user.id)
+        if self._poster_only:
+            if LOG_CHANNEL_ID:
+                ch = self.get_channel(LOG_CHANNEL_ID)
+                if isinstance(ch, discord.TextChannel):
+                    _log_poster = self
+                    self._log_channel = ch
+                    console.info("Log channel: #%s (%s) (dedicated poster: %s)", ch.name, ch.id, self.user)
+            return
         claimed = []
         for guild in self.guilds:
             if guild.id not in _guild_owner:
@@ -294,7 +310,7 @@ class MessageLogger(discord.Client):
                 console.info("Log channel: #%s (%s) (poster: %s)", ch.name, ch.id, self.user)
 
     async def on_message(self, message: discord.Message) -> None:
-        if not _is_watched(message, id(self)):
+        if not self._is_watched(message):
             return
         if self._log_channel and message.channel.id == self._log_channel.id:
             return
@@ -372,7 +388,7 @@ class MessageLogger(discord.Client):
         console.info("Edit logged: %s in %s", after.author, _channel_label(after))
 
     async def on_message_delete(self, message: discord.Message) -> None:
-        if not _is_watched(message, id(self)):
+        if not self._is_watched(message):
             return
 
         cached = await self._pop_cached(message.id)
@@ -444,7 +460,7 @@ class MessageLogger(discord.Client):
 
     async def on_bulk_message_delete(self,
                                       messages: list[discord.Message]) -> None:
-        watched = [m for m in messages if _is_watched(m, id(self))]
+        watched = [m for m in messages if self._is_watched(m)]
         if not watched:
             return
 
@@ -523,11 +539,15 @@ async def main() -> None:
     """)
     await db.commit()
 
-    clients = [MessageLogger(db) for _ in TOKENS]
+    clients: list[MessageLogger] = [MessageLogger(db) for _ in TOKENS]
+    tokens: list[str] = list(TOKENS)
+    if LOG_POSTER_TOKEN:
+        clients.append(MessageLogger(db, poster_only=True))
+        tokens.append(LOG_POSTER_TOKEN)
     try:
         await asyncio.gather(*[
             client.start(token)
-            for client, token in zip(clients, TOKENS)
+            for client, token in zip(clients, tokens)
         ])
     finally:
         await asyncio.gather(*[client.close() for client in clients])
