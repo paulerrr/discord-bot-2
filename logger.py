@@ -349,7 +349,7 @@ class MessageLogger(discord.Client):
     async def on_message_edit(self,
                                before: discord.Message,
                                after: discord.Message) -> None:
-        if not _is_watched(after, id(self)):
+        if not self._is_watched(after):
             return
         if self._log_channel and after.channel.id == self._log_channel.id:
             return
