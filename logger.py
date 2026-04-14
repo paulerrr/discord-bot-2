@@ -208,14 +208,17 @@ class MessageLogger(discord.Client):
         self._session: aiohttp.ClientSession | None = None
         self._log_channel: discord.TextChannel | None = None
 
-    def _is_watched(self, message: discord.Message) -> bool:
+    def _is_watched_guild(self, guild_id: int | None) -> bool:
         if self._poster_only:
             return False
-        if WATCHED_GUILDS and (not message.guild or message.guild.id not in WATCHED_GUILDS):
+        if guild_id is None:
+            return not bool(WATCHED_GUILDS)
+        if WATCHED_GUILDS and guild_id not in WATCHED_GUILDS:
             return False
-        if message.guild and _guild_owner.get(message.guild.id) != id(self):
-            return False
-        return True
+        return _guild_owner.get(guild_id) == id(self)
+
+    def _is_watched(self, message: discord.Message) -> bool:
+        return self._is_watched_guild(message.guild.id if message.guild else None)
 
     async def setup_hook(self) -> None:
         self._session = aiohttp.ClientSession()
@@ -410,26 +413,48 @@ class MessageLogger(discord.Client):
         await self._log_to_channel(channel_post, files=files)
         console.info("Edit logged: %s in %s", after.author, _channel_label(after))
 
-    async def on_message_delete(self, message: discord.Message) -> None:
-        if not self._is_watched(message):
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
+        if not self._is_watched_guild(payload.guild_id):
             return
 
-        cached = await self._pop_cached(message.id)
-        if cached is None:
+        cached = await self._pop_cached(payload.message_id)
+
+        if cached is None and payload.cached_message is not None:
+            msg = payload.cached_message
             cached = CachedMessage(
-                id=message.id,
-                author=str(message.author),
-                author_id=message.author.id,
-                channel=str(message.channel),
-                guild_name=message.guild.name if message.guild else None,
-                content=message.content,
-                created_at=message.created_at,
-                attachments=[{"filename": a.filename, "url": a.url} for a in message.attachments],
-                stickers=[{"id": s.id, "name": s.name, "format": s.format.name} for s in message.stickers],
+                id=msg.id,
+                author=str(msg.author),
+                author_id=msg.author.id,
+                channel=str(msg.channel),
+                guild_name=msg.guild.name if msg.guild else None,
+                content=msg.content,
+                created_at=msg.created_at,
+                attachments=[{"filename": a.filename, "url": a.url} for a in msg.attachments],
+                stickers=[{"id": s.id, "name": s.name, "format": s.format.name} for s in msg.stickers],
             )
 
-        channel_label = f"#{cached.channel}" if cached.guild_name else f"DM:{cached.channel}"
+        guild_dir = MEDIA_DIR / (str(payload.guild_id) if payload.guild_id else "DMs")
         date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        if cached is None:
+            ch = self.get_channel(payload.channel_id)
+            channel_str = getattr(ch, "name", str(payload.channel_id))
+            guild_name: str | None = None
+            if payload.guild_id:
+                g = self.get_guild(payload.guild_id)
+                guild_name = g.name if g else None
+            channel_label = f"#{channel_str}" if guild_name else f"DM:{channel_str}"
+            path = _log_path(guild_name, channel_str, date)
+            _write(path, (
+                f"[{_format_ts(datetime.now(timezone.utc))}] "
+                f"[DELETE] <unknown> in {channel_label}\n"
+                f"  Message ID: {payload.message_id}\n"
+                f"  Content: <unknown>\n\n"
+            ))
+            console.info("Delete logged (no cache): msg %s in %s", payload.message_id, channel_label)
+            return
+
+        channel_label = f"#{cached.channel}" if cached.guild_name else f"DM:{cached.channel}"
         path = _log_path(cached.guild_name, cached.channel, date)
 
         lines: list[str] = [
@@ -443,7 +468,7 @@ class MessageLogger(discord.Client):
         if cached.attachments:
             lines.append(f"  Attachments ({len(cached.attachments)}):\n")
             for att in cached.attachments:
-                local = MEDIA_DIR / (str(message.guild.id) if message.guild else "DMs") / f"{cached.id}_{att['filename']}"
+                local = guild_dir / f"{cached.id}_{att['filename']}"
                 label = str(local) if local.exists() else att['url']
                 lines.append(f"    - {att['filename']}  →  {label}\n")
 
@@ -454,7 +479,6 @@ class MessageLogger(discord.Client):
 
         lines.append("\n")
         _write(path, "".join(lines))
-        guild_dir = MEDIA_DIR / (str(message.guild.id) if message.guild else "DMs")
         files = [
             discord.File(p)
             for att in cached.attachments
@@ -477,34 +501,53 @@ class MessageLogger(discord.Client):
             post_lines.append("Attachments: " + "  ".join(a['filename'] for a in cached.attachments))
         if cached.stickers:
             post_lines.append("Stickers: " + "  ".join(s['name'] for s in cached.stickers))
-        channel_post = "\n".join(post_lines)
-        await self._log_to_channel(channel_post, files=files)
+        await self._log_to_channel("\n".join(post_lines), files=files)
         console.info("Delete logged: %s in %s", cached.author, channel_label)
 
-    async def on_bulk_message_delete(self,
-                                      messages: list[discord.Message]) -> None:
-        watched = [m for m in messages if self._is_watched(m)]
-        if not watched:
+    async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent) -> None:
+        if not self._is_watched_guild(payload.guild_id):
             return
+
+        dpy_cached: dict[int, discord.Message] = {m.id: m for m in payload.cached_messages}
+
+        ch = self.get_channel(payload.channel_id)
+        channel_str = getattr(ch, "name", str(payload.channel_id))
+        guild_name: str | None = None
+        if payload.guild_id:
+            g = self.get_guild(payload.guild_id)
+            guild_name = g.name if g else None
+        channel_label = f"#{channel_str}" if guild_name else f"DM:{channel_str}"
 
         date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         entries: list[tuple] = []
 
-        for message in watched:
-            cached = await self._pop_cached(message.id)
-            guild_name = message.guild.name if message.guild else None
-            channel_str = str(message.channel)
-            channel_label = f"#{channel_str}" if guild_name else f"DM:{channel_str}"
-            content = cached.content if cached else (message.content or "<unknown>")
-            stickers = cached.stickers if cached else [
-                {"id": s.id, "name": s.name, "format": s.format.name}
-                for s in message.stickers
-            ]
-            entries.append((message, guild_name, channel_label, content, stickers))
+        for message_id in payload.message_ids:
+            cached = await self._pop_cached(message_id)
+
+            if cached is None and message_id in dpy_cached:
+                msg = dpy_cached[message_id]
+                cached = CachedMessage(
+                    id=msg.id,
+                    author=str(msg.author),
+                    author_id=msg.author.id,
+                    channel=str(msg.channel),
+                    guild_name=msg.guild.name if msg.guild else None,
+                    content=msg.content,
+                    created_at=msg.created_at,
+                    attachments=[{"filename": a.filename, "url": a.url} for a in msg.attachments],
+                    stickers=[{"id": s.id, "name": s.name, "format": s.format.name} for s in msg.stickers],
+                )
+
+            author_str = cached.author if cached else "<unknown>"
+            author_id = cached.author_id if cached else 0
+            content = cached.content if cached else "<unknown>"
+            stickers = cached.stickers if cached else []
+
+            entries.append((author_str, author_id, content, stickers))
             path = _log_path(guild_name, channel_str, date)
             log_lines = [
                 f"[{_format_ts(datetime.now(timezone.utc))}] "
-                f"[BULK-DELETE] {message.author} ({message.author.id}) "
+                f"[BULK-DELETE] {author_str} ({author_id}) "
                 f"in {channel_label}\n",
                 f"  Content: {content}\n",
             ]
@@ -517,14 +560,13 @@ class MessageLogger(discord.Client):
             _write(path, "".join(log_lines))
 
         # One summary post instead of N individual posts.
-        first_msg, first_guild, first_ch_label, _, _ = entries[0]
         post_lines = [
-            f"🗑️ Bulk Delete ({len(watched)} messages)",
-            f"Channel: {first_ch_label}" + (f"  ·  {first_guild}" if first_guild else ""),
+            f"🗑️ Bulk Delete ({len(payload.message_ids)} messages)",
+            f"Channel: {channel_label}" + (f"  ·  {guild_name}" if guild_name else ""),
         ]
         MAX_PREVIEW = 10
-        for msg, _, _, content, _ in entries[:MAX_PREVIEW]:
-            author = discord.utils.escape_markdown(str(msg.author))
+        for author_str, _, content, _ in entries[:MAX_PREVIEW]:
+            author = discord.utils.escape_markdown(author_str)
             preview = discord.utils.escape_markdown(content[:80])
             if len(content) > 80:
                 preview += "…"
@@ -532,7 +574,7 @@ class MessageLogger(discord.Client):
         if len(entries) > MAX_PREVIEW:
             post_lines.append(f"  [+ {len(entries) - MAX_PREVIEW} more]")
         await self._log_to_channel("\n".join(post_lines))
-        console.info("Bulk delete: %d messages", len(watched))
+        console.info("Bulk delete: %d messages", len(payload.message_ids))
 
     async def on_error(self, event: str, *args, **kwargs) -> None:  # type: ignore[override]
         import traceback
