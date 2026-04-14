@@ -1,5 +1,6 @@
 import discord
 import asyncio
+import io
 import os
 import json
 import aiohttp
@@ -37,6 +38,18 @@ LOG_CHANNEL_ID: int | None = (
 # Optional dedicated token whose sole job is posting to LOG_CHANNEL_ID.
 # This account does not need to be in any WATCHED_GUILDS.
 LOG_POSTER_TOKEN: str | None = os.environ.get("LOG_POSTER_TOKEN", "").strip() or None
+
+# channel_id:webhook_url pairs, comma-separated.
+# A channel can appear multiple times to fan out to multiple webhooks.
+MIRROR_MAP: dict[int, list[str]] = {}
+for _pair in os.environ.get("MIRROR_CHANNELS", "").split(","):
+    _pair = _pair.strip()
+    if not _pair:
+        continue
+    _cid, _, _wurl = _pair.partition(":")
+    _cid, _wurl = _cid.strip(), _wurl.strip()
+    if _cid and _wurl:
+        MIRROR_MAP.setdefault(int(_cid), []).append(_wurl)
 
 BASE_LOG_DIR = Path("logs")
 MEDIA_DIR = Path("media")
@@ -221,8 +234,8 @@ class MessageLogger(discord.Client):
         ])
         await self._db.execute(
             """INSERT OR REPLACE INTO messages
-               (id, author, author_id, channel, guild_name, content, created_at, attachments, stickers)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (id, author, author_id, channel, guild_name, content, created_at, attachments, stickers, avatar_url)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 message.id,
                 str(message.author),
@@ -233,6 +246,7 @@ class MessageLogger(discord.Client):
                 message.created_at.isoformat(),
                 attachments,
                 stickers,
+                str(message.author.display_avatar.url),
             ),
         )
         await self._db.commit()
@@ -345,6 +359,15 @@ class MessageLogger(discord.Client):
 
         lines.append("\n")
         _write(path, "".join(lines))
+
+        if not self._poster_only and message.channel.id in MIRROR_MAP:
+            if not message.guild or _guild_owner.get(message.guild.id) == id(self):
+                for wurl in MIRROR_MAP[message.channel.id]:
+                    await self._db.execute(
+                        "INSERT OR IGNORE INTO mirror_queue (message_id, webhook_url) VALUES (?, ?)",
+                        (message.id, wurl),
+                    )
+                await self._db.commit()
 
     async def on_message_edit(self,
                                before: discord.Message,
@@ -516,6 +539,69 @@ class MessageLogger(discord.Client):
         console.error("Error in %s:\n%s", event, traceback.format_exc())
 
 
+async def _mirror_worker(db: aiosqlite.Connection, session: aiohttp.ClientSession) -> None:
+    """Reads mirror_queue rows and posts each to its webhook with spoofed identity."""
+    while True:
+        async with db.execute(
+            """SELECT q.id, q.webhook_url,
+                      m.author, m.avatar_url, m.content, m.attachments, m.stickers
+               FROM mirror_queue q
+               JOIN messages m ON q.message_id = m.id
+               ORDER BY q.id
+               LIMIT 1"""
+        ) as cursor:
+            row = await cursor.fetchone()
+
+        if row is None:
+            await asyncio.sleep(0.5)
+            continue
+
+        queue_id, webhook_url, author, avatar_url, content, attachments_json, stickers_json = row
+        attachments: list[dict] = json.loads(attachments_json) if attachments_json else []
+        stickers: list[dict] = json.loads(stickers_json) if stickers_json else []
+
+        try:
+            wh = discord.Webhook.from_url(webhook_url, session=session)
+            files: list[discord.File] = []
+            extra_urls: list[str] = []
+
+            for att in attachments:
+                try:
+                    async with _download_sem:
+                        async with session.get(att["url"]) as resp:
+                            if resp.status == 200:
+                                data = await resp.read()
+                                if len(data) < 8 * 1024 * 1024:
+                                    files.append(discord.File(io.BytesIO(data), filename=att["filename"]))
+                                else:
+                                    extra_urls.append(att["url"])
+                            else:
+                                extra_urls.append(att["url"])
+                except Exception as exc:
+                    console.warning("Mirror attachment fetch failed (%s): %s", att["filename"], exc)
+                    extra_urls.append(att["url"])
+
+            for s in stickers:
+                extra_urls.append(f"https://media.discordapp.net/stickers/{s['id']}.webp")
+
+            post_content = content or ""
+            if extra_urls:
+                post_content = (post_content + "\n" + "\n".join(extra_urls)).strip()
+
+            await wh.send(
+                content=post_content or "\u200b",
+                username=author,
+                avatar_url=avatar_url,
+                files=files or discord.utils.MISSING,
+            )
+            console.info("Mirrored message to %s", webhook_url[:40])
+        except Exception as exc:
+            console.warning("Mirror post to %s failed: %s", webhook_url[:40], exc)
+        finally:
+            await db.execute("DELETE FROM mirror_queue WHERE id = ?", (queue_id,))
+            await db.commit()
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main() -> None:
@@ -534,10 +620,29 @@ async def main() -> None:
             content     TEXT,
             created_at  TEXT    NOT NULL,
             attachments TEXT,
-            stickers    TEXT
+            stickers    TEXT,
+            avatar_url  TEXT
+        )
+    """)
+    # Migrate existing DBs that predate the avatar_url column.
+    try:
+        await db.execute("ALTER TABLE messages ADD COLUMN avatar_url TEXT")
+    except Exception:
+        pass
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS mirror_queue (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id  INTEGER NOT NULL,
+            webhook_url TEXT    NOT NULL,
+            UNIQUE(message_id, webhook_url)
         )
     """)
     await db.commit()
+
+    mirror_session = aiohttp.ClientSession()
+    mirror_worker = asyncio.create_task(
+        _mirror_worker(db, mirror_session), name="mirror-worker"
+    )
 
     clients: list[MessageLogger] = [MessageLogger(db) for _ in TOKENS]
     tokens: list[str] = list(TOKENS)
@@ -552,11 +657,13 @@ async def main() -> None:
     finally:
         await asyncio.gather(*[client.close() for client in clients])
         await db.close()
-        worker.cancel()
-        try:
-            await worker
-        except asyncio.CancelledError:
-            pass
+        for task in (worker, mirror_worker):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await mirror_session.close()
 
 
 if __name__ == "__main__":
