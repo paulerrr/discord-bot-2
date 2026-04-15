@@ -365,13 +365,10 @@ class MessageLogger(discord.Client):
 
         if not self._poster_only and message.channel.id in MIRROR_MAP:
             if not message.guild or _guild_owner.get(message.guild.id) == id(self):
-                reply_to: int | None = None
-                if message.reference is not None:
-                    reply_to = message.reference.message_id
                 for wurl in MIRROR_MAP[message.channel.id]:
                     await self._db.execute(
-                        "INSERT OR IGNORE INTO mirror_queue (message_id, webhook_url, reply_to) VALUES (?, ?, ?)",
-                        (message.id, wurl, reply_to),
+                        "INSERT OR IGNORE INTO mirror_queue (message_id, webhook_url) VALUES (?, ?)",
+                        (message.id, wurl),
                     )
                 await self._db.commit()
 
@@ -588,7 +585,7 @@ async def _mirror_worker(db: aiosqlite.Connection, session: aiohttp.ClientSessio
     """Reads mirror_queue rows and posts each to its webhook with spoofed identity."""
     while True:
         async with db.execute(
-            """SELECT q.id, q.webhook_url, q.reply_to,
+            """SELECT q.id, q.webhook_url,
                       m.author, m.avatar_url, m.content, m.attachments, m.stickers
                FROM mirror_queue q
                JOIN messages m ON q.message_id = m.id
@@ -601,7 +598,7 @@ async def _mirror_worker(db: aiosqlite.Connection, session: aiohttp.ClientSessio
             await asyncio.sleep(0.5)
             continue
 
-        queue_id, webhook_url, reply_to, author, avatar_url, content, attachments_json, stickers_json = row
+        queue_id, webhook_url, author, avatar_url, content, attachments_json, stickers_json = row
         attachments: list[dict] = json.loads(attachments_json) if attachments_json else []
         stickers: list[dict] = json.loads(stickers_json) if stickers_json else []
 
@@ -630,17 +627,6 @@ async def _mirror_worker(db: aiosqlite.Connection, session: aiohttp.ClientSessio
                 extra_urls.append(f"https://media.discordapp.net/stickers/{s['id']}.webp")
 
             post_content = content or ""
-            if reply_to is not None:
-                async with db.execute(
-                    "SELECT author, content FROM messages WHERE id = ?", (reply_to,)
-                ) as ref_cursor:
-                    ref_row = await ref_cursor.fetchone()
-                if ref_row:
-                    ref_author, ref_content = ref_row
-                    ref_preview = (ref_content or "")[:100]
-                    if len(ref_content or "") > 100:
-                        ref_preview += "…"
-                    post_content = f"> **{ref_author}**: {ref_preview}\n{post_content}"
             if extra_urls:
                 post_content = (post_content + "\n" + "\n".join(extra_urls)).strip()
 
@@ -690,14 +676,9 @@ async def main() -> None:
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             message_id  INTEGER NOT NULL,
             webhook_url TEXT    NOT NULL,
-            reply_to    INTEGER,
             UNIQUE(message_id, webhook_url)
         )
     """)
-    try:
-        await db.execute("ALTER TABLE mirror_queue ADD COLUMN reply_to INTEGER")
-    except Exception:
-        pass
     await db.commit()
 
     mirror_session = aiohttp.ClientSession()
