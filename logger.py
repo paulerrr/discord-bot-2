@@ -51,20 +51,6 @@ for _pair in os.environ.get("MIRROR_CHANNELS", "").split(","):
     if _cid and _wurl:
         MIRROR_MAP.setdefault(int(_cid), []).append(_wurl)
 
-# source_guild_id:dest_guild_id pairs, comma-separated.
-# Bot auto-detects which token is in each guild and sets up channels/webhooks.
-MIRROR_SERVERS: list[tuple[int, int]] = []
-for _pair in os.environ.get("MIRROR_SERVERS", "").split(","):
-    _pair = _pair.strip()
-    if not _pair:
-        continue
-    _src, _, _dst = _pair.partition(":")
-    _src, _dst = _src.strip(), _dst.strip()
-    if _src and _dst:
-        MIRROR_SERVERS.append((int(_src), int(_dst)))
-
-_server_mirror_src: set[int] = {s for s, _d in MIRROR_SERVERS}
-
 BASE_LOG_DIR = Path("logs")
 MEDIA_DIR = Path("media")
 # ─────────────────────────────────────────────────────────────────────────────
@@ -137,10 +123,6 @@ class CachedMessage:
 # First account to connect claims each guild; others skip it.
 _guild_owner: dict[int, int] = {}  # guild_id → id(client)
 
-# Maps guild_id → any client instance that is a member of that guild.
-# Used by server-mirror setup to find the right client for channel/webhook creation.
-_guild_client: dict[int, "MessageLogger"] = {}
-
 # The first client that can see LOG_CHANNEL_ID claims it for posting.
 # This may differ from the guild owner if that account lacks channel access.
 _log_poster: "MessageLogger | None" = None
@@ -149,11 +131,6 @@ _log_poster: "MessageLogger | None" = None
 _post_queue: asyncio.Queue[tuple[str, list]] = asyncio.Queue()
 # Caps concurrent media downloads.
 _download_sem = asyncio.Semaphore(5)
-
-# Server-mirror ready coordination.
-_ready_count   = 0        # incremented each time a non-poster client fires on_ready
-_total_clients = 0        # set in main() before asyncio.gather
-_server_mirror_ready: asyncio.Event | None = None  # created in main()
 
 
 
@@ -219,141 +196,6 @@ async def _save_sticker(session: aiohttp.ClientSession,
     except Exception as exc:
         console.warning("Failed to save sticker %s: %s", sticker.name, exc)
     return None
-
-
-# ── Server mirror helpers ─────────────────────────────────────────────────────
-
-async def _ensure_server_mirror_channel(
-    db: aiosqlite.Connection,
-    dst_client: "MessageLogger",
-    dst_guild: discord.Guild,
-    src_channel: discord.TextChannel,
-) -> None:
-    """Create (if needed) a matching channel + webhook in dst_guild for src_channel,
-    then record the mapping in server_mirror_channels. Idempotent."""
-    async with db.execute(
-        "SELECT webhook_url FROM server_mirror_channels WHERE source_channel_id = ?",
-        (src_channel.id,),
-    ) as cur:
-        if await cur.fetchone():
-            return  # already mapped
-
-    # Find or create the destination channel.
-    dst_channel = discord.utils.get(dst_guild.text_channels, name=src_channel.name)
-    if dst_channel is None:
-        dst_category: discord.CategoryChannel | None = None
-        if src_channel.category:
-            dst_category = discord.utils.get(dst_guild.categories, name=src_channel.category.name)
-            if dst_category is None:
-                try:
-                    dst_category = await dst_guild.create_category(src_channel.category.name)
-                    console.info("Server mirror: created category '%s' in %s", src_channel.category.name, dst_guild.name)
-                except Exception as exc:
-                    console.warning("Server mirror: could not create category '%s': %s", src_channel.category.name, exc)
-        try:
-            dst_channel = await dst_guild.create_text_channel(
-                src_channel.name,
-                category=dst_category,
-                topic=src_channel.topic or "",
-            )
-            console.info("Server mirror: created channel #%s in %s", src_channel.name, dst_guild.name)
-        except Exception as exc:
-            console.warning("Server mirror: could not create channel #%s: %s", src_channel.name, exc)
-            return
-
-    # Find or create the webhook.
-    try:
-        webhooks = await dst_channel.webhooks()
-        wh = discord.utils.get(webhooks, name="MessageMirror")
-        if wh is None:
-            wh = await dst_channel.create_webhook(name="MessageMirror")
-            console.info("Server mirror: created webhook in #%s (%s)", dst_channel.name, dst_guild.name)
-    except Exception as exc:
-        console.warning("Server mirror: could not create webhook in #%s: %s", dst_channel.name, exc)
-        return
-
-    await db.execute(
-        "INSERT OR REPLACE INTO server_mirror_channels (source_channel_id, dest_channel_id, webhook_url) VALUES (?, ?, ?)",
-        (src_channel.id, dst_channel.id, wh.url),
-    )
-    await db.commit()
-
-
-async def _ensure_server_mirror_voice_channel(
-    db: aiosqlite.Connection,
-    dst_client: "MessageLogger",
-    dst_guild: discord.Guild,
-    src_channel: discord.VoiceChannel,
-) -> None:
-    """Create a matching voice channel + webhook in dst_guild, and record the mapping."""
-    async with db.execute(
-        "SELECT webhook_url FROM server_mirror_channels WHERE source_channel_id = ?",
-        (src_channel.id,),
-    ) as cur:
-        if await cur.fetchone():
-            return
-
-    dst_channel = discord.utils.get(dst_guild.text_channels, name=src_channel.name)
-    if dst_channel is None:
-        dst_category: discord.CategoryChannel | None = None
-        if src_channel.category:
-            dst_category = discord.utils.get(dst_guild.categories, name=src_channel.category.name)
-            if dst_category is None:
-                try:
-                    dst_category = await dst_guild.create_category(src_channel.category.name)
-                    console.info("Server mirror: created category '%s' in %s", src_channel.category.name, dst_guild.name)
-                except Exception as exc:
-                    console.warning("Server mirror: could not create category '%s': %s", src_channel.category.name, exc)
-        try:
-            dst_channel = await dst_guild.create_text_channel(src_channel.name, category=dst_category)
-            console.info("Server mirror: created text channel #%s (from voice) in %s", src_channel.name, dst_guild.name)
-        except Exception as exc:
-            console.warning("Server mirror: could not create voice channel #%s: %s", src_channel.name, exc)
-            return
-
-    try:
-        webhooks = await dst_channel.webhooks()
-        wh = discord.utils.get(webhooks, name="MessageMirror")
-        if wh is None:
-            wh = await dst_channel.create_webhook(name="MessageMirror")
-            console.info("Server mirror: created webhook in voice #%s (%s)", dst_channel.name, dst_guild.name)
-    except Exception as exc:
-        console.warning("Server mirror: could not create webhook in voice #%s: %s", dst_channel.name, exc)
-        return
-
-    await db.execute(
-        "INSERT OR REPLACE INTO server_mirror_channels (source_channel_id, dest_channel_id, webhook_url) VALUES (?, ?, ?)",
-        (src_channel.id, dst_channel.id, wh.url),
-    )
-    await db.commit()
-
-
-async def _setup_server_mirrors(db: aiosqlite.Connection) -> None:
-    """Wait for all clients to be ready, then set up channel/webhook mappings for each
-    MIRROR_SERVERS pair."""
-    if not MIRROR_SERVERS or _server_mirror_ready is None:
-        return
-    await _server_mirror_ready.wait()
-    for src_guild_id, dst_guild_id in MIRROR_SERVERS:
-        src_client = _guild_client.get(src_guild_id)
-        dst_client = _guild_client.get(dst_guild_id)
-        if src_client is None:
-            console.warning("Server mirror: no client found in source guild %s — skipping", src_guild_id)
-            continue
-        if dst_client is None:
-            console.warning("Server mirror: no client found in dest guild %s — skipping", dst_guild_id)
-            continue
-        src_guild = src_client.get_guild(src_guild_id)
-        dst_guild = dst_client.get_guild(dst_guild_id)
-        if src_guild is None or dst_guild is None:
-            console.warning("Server mirror: guild object unavailable for %s→%s", src_guild_id, dst_guild_id)
-            continue
-        console.info("Server mirror: setting up %s → %s (%d text, %d voice channels)",
-                     src_guild.name, dst_guild.name, len(src_guild.text_channels), len(src_guild.voice_channels))
-        for channel in src_guild.text_channels:
-            await _ensure_server_mirror_channel(db, dst_client, dst_guild, channel)
-        for channel in src_guild.voice_channels:
-            await _ensure_server_mirror_voice_channel(db, dst_client, dst_guild, channel)
 
 
 # ── Client ────────────────────────────────────────────────────────────────────
@@ -460,11 +302,9 @@ class MessageLogger(discord.Client):
         await _post_queue.put((text, files or []))
 
     async def on_ready(self) -> None:
-        global _log_poster, _ready_count
+        global _log_poster
         console.info("Logged in as %s (id: %s)", self.user, self.user.id)
         if self._poster_only:
-            for guild in self.guilds:
-                _guild_client.setdefault(guild.id, self)
             if LOG_CHANNEL_ID:
                 ch = self.get_channel(LOG_CHANNEL_ID)
                 if isinstance(ch, discord.TextChannel):
@@ -477,7 +317,6 @@ class MessageLogger(discord.Client):
             if guild.id not in _guild_owner:
                 _guild_owner[guild.id] = id(self)
                 claimed.append(guild.name)
-            _guild_client.setdefault(guild.id, self)
         if claimed:
             console.info("Claimed guilds: %s", claimed)
         if LOG_CHANNEL_ID and _log_poster is None:
@@ -486,9 +325,6 @@ class MessageLogger(discord.Client):
                 _log_poster = self
                 self._log_channel = ch
                 console.info("Log channel: #%s (%s) (poster: %s)", ch.name, ch.id, self.user)
-        _ready_count += 1
-        if _server_mirror_ready is not None and _ready_count >= _total_clients:
-            _server_mirror_ready.set()
 
     async def on_message(self, message: discord.Message) -> None:
         if not self._is_watched(message):
@@ -534,19 +370,6 @@ class MessageLogger(discord.Client):
                         "INSERT OR IGNORE INTO mirror_queue (message_id, webhook_url) VALUES (?, ?)",
                         (message.id, wurl),
                     )
-                await self._db.commit()
-
-        if message.guild and message.guild.id in _server_mirror_src:
-            async with self._db.execute(
-                "SELECT webhook_url FROM server_mirror_channels WHERE source_channel_id = ?",
-                (message.channel.id,),
-            ) as cur:
-                row = await cur.fetchone()
-            if row:
-                await self._db.execute(
-                    "INSERT OR IGNORE INTO mirror_queue (message_id, webhook_url) VALUES (?, ?)",
-                    (message.id, row[0]),
-                )
                 await self._db.commit()
 
     async def on_message_edit(self,
@@ -753,21 +576,6 @@ class MessageLogger(discord.Client):
         await self._log_to_channel("\n".join(post_lines))
         console.info("Bulk delete: %d messages", len(payload.message_ids))
 
-    async def on_guild_channel_create(self, channel: discord.abc.GuildChannel) -> None:
-        if not isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
-            return
-        for src_id, dst_id in MIRROR_SERVERS:
-            if channel.guild.id == src_id:
-                dst_client = _guild_client.get(dst_id)
-                if dst_client:
-                    dst_guild = dst_client.get_guild(dst_id)
-                    if dst_guild:
-                        if isinstance(channel, discord.TextChannel):
-                            await _ensure_server_mirror_channel(self._db, dst_client, dst_guild, channel)
-                        else:
-                            await _ensure_server_mirror_voice_channel(self._db, dst_client, dst_guild, channel)
-                break
-
     async def on_error(self, event: str, *args, **kwargs) -> None:  # type: ignore[override]
         import traceback
         console.error("Error in %s:\n%s", event, traceback.format_exc())
@@ -839,7 +647,6 @@ async def _mirror_worker(db: aiosqlite.Connection, session: aiohttp.ClientSessio
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    global _total_clients, _server_mirror_ready
     console.info("Starting %d account(s)", len(TOKENS))
 
     worker = asyncio.create_task(_post_worker(), name="log-poster")
@@ -872,13 +679,6 @@ async def main() -> None:
             UNIQUE(message_id, webhook_url)
         )
     """)
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS server_mirror_channels (
-            source_channel_id  INTEGER PRIMARY KEY,
-            dest_channel_id    INTEGER NOT NULL,
-            webhook_url        TEXT    NOT NULL
-        )
-    """)
     await db.commit()
 
     mirror_session = aiohttp.ClientSession()
@@ -888,14 +688,9 @@ async def main() -> None:
 
     clients: list[MessageLogger] = [MessageLogger(db) for _ in TOKENS]
     tokens: list[str] = list(TOKENS)
-    _total_clients = len(clients)  # count non-poster clients for ready coordination
-    _server_mirror_ready = asyncio.Event()
     if LOG_POSTER_TOKEN:
         clients.append(MessageLogger(db, poster_only=True))
         tokens.append(LOG_POSTER_TOKEN)
-
-    server_mirror_setup = asyncio.create_task(_setup_server_mirrors(db), name="server-mirror-setup")
-
     try:
         await asyncio.gather(*[
             client.start(token)
@@ -904,7 +699,7 @@ async def main() -> None:
     finally:
         await asyncio.gather(*[client.close() for client in clients])
         await db.close()
-        for task in (worker, mirror_worker, server_mirror_setup):
+        for task in (worker, mirror_worker):
             task.cancel()
             try:
                 await task
