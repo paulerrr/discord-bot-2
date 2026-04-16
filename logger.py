@@ -4,7 +4,7 @@ import io
 import os
 import json
 import aiohttp
-import aiosqlite
+import asyncpg
 import logging
 import logging.handlers
 from dataclasses import dataclass
@@ -50,6 +50,10 @@ for _pair in os.environ.get("MIRROR_CHANNELS", "").split(","):
     _cid, _wurl = _cid.strip(), _wurl.strip()
     if _cid and _wurl:
         MIRROR_MAP.setdefault(int(_cid), []).append(_wurl)
+
+DATABASE_URL: str = os.environ.get("SUPABASE_DATABASE_URL", "")
+if not DATABASE_URL:
+    raise RuntimeError("Set SUPABASE_DATABASE_URL in your .env")
 
 BASE_LOG_DIR = Path("logs")
 MEDIA_DIR = Path("media")
@@ -201,7 +205,7 @@ async def _save_sticker(session: aiohttp.ClientSession,
 # ── Client ────────────────────────────────────────────────────────────────────
 
 class MessageLogger(discord.Client):
-    def __init__(self, db: aiosqlite.Connection, poster_only: bool = False) -> None:
+    def __init__(self, db: asyncpg.Pool, poster_only: bool = False) -> None:
         super().__init__()
         self._db = db
         self._poster_only = poster_only
@@ -236,31 +240,33 @@ class MessageLogger(discord.Client):
             {"id": s.id, "name": s.name, "format": s.format.name} for s in message.stickers
         ])
         await self._db.execute(
-            """INSERT OR REPLACE INTO messages
+            """INSERT INTO messages
                (id, author, author_id, channel, guild_name, content, created_at, attachments, stickers, avatar_url)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                message.id,
-                str(message.author),
-                message.author.id,
-                str(message.channel),
-                message.guild.name if message.guild else None,
-                message.content,
-                message.created_at.isoformat(),
-                attachments,
-                stickers,
-                str(message.author.display_avatar.url),
-            ),
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+               ON CONFLICT (id) DO UPDATE SET
+                   author=EXCLUDED.author, author_id=EXCLUDED.author_id,
+                   channel=EXCLUDED.channel, guild_name=EXCLUDED.guild_name,
+                   content=EXCLUDED.content, created_at=EXCLUDED.created_at,
+                   attachments=EXCLUDED.attachments, stickers=EXCLUDED.stickers,
+                   avatar_url=EXCLUDED.avatar_url""",
+            message.id,
+            str(message.author),
+            message.author.id,
+            str(message.channel),
+            message.guild.name if message.guild else None,
+            message.content,
+            message.created_at.isoformat(),
+            attachments,
+            stickers,
+            str(message.author.display_avatar.url),
         )
-        await self._db.commit()
 
     async def _pop_cached(self, message_id: int) -> CachedMessage | None:
-        async with self._db.execute(
+        row = await self._db.fetchrow(
             "SELECT id, author, author_id, channel, guild_name, content, created_at, attachments, stickers "
-            "FROM messages WHERE id = ?",
-            (message_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
+            "FROM messages WHERE id = $1",
+            message_id,
+        )
         if not row:
             return None
         return CachedMessage(
@@ -367,10 +373,9 @@ class MessageLogger(discord.Client):
             if not message.guild or _guild_owner.get(message.guild.id) == id(self):
                 for wurl in MIRROR_MAP[message.channel.id]:
                     await self._db.execute(
-                        "INSERT OR IGNORE INTO mirror_queue (message_id, webhook_url) VALUES (?, ?)",
-                        (message.id, wurl),
+                        "INSERT INTO mirror_queue (message_id, webhook_url) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                        message.id, wurl,
                     )
-                await self._db.commit()
 
     async def on_message_edit(self,
                                before: discord.Message,
@@ -581,18 +586,17 @@ class MessageLogger(discord.Client):
         console.error("Error in %s:\n%s", event, traceback.format_exc())
 
 
-async def _mirror_worker(db: aiosqlite.Connection, session: aiohttp.ClientSession) -> None:
+async def _mirror_worker(db: asyncpg.Pool, session: aiohttp.ClientSession) -> None:
     """Reads mirror_queue rows and posts each to its webhook with spoofed identity."""
     while True:
-        async with db.execute(
+        row = await db.fetchrow(
             """SELECT q.id, q.webhook_url,
                       m.author, m.avatar_url, m.content, m.attachments, m.stickers
                FROM mirror_queue q
                JOIN messages m ON q.message_id = m.id
                ORDER BY q.id
                LIMIT 1"""
-        ) as cursor:
-            row = await cursor.fetchone()
+        )
 
         if row is None:
             await asyncio.sleep(0.5)
@@ -640,8 +644,7 @@ async def _mirror_worker(db: aiosqlite.Connection, session: aiohttp.ClientSessio
         except Exception as exc:
             console.warning("Mirror post to %s failed: %s", webhook_url[:40], exc)
         finally:
-            await db.execute("DELETE FROM mirror_queue WHERE id = ?", (queue_id,))
-            await db.commit()
+            await db.execute("DELETE FROM mirror_queue WHERE id = $1", queue_id)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -650,36 +653,29 @@ async def main() -> None:
     console.info("Starting %d account(s)", len(TOKENS))
 
     worker = asyncio.create_task(_post_worker(), name="log-poster")
-    db = await aiosqlite.connect("cache.db")
-    await db.execute("PRAGMA journal_mode=WAL")
+    db = await asyncpg.create_pool(DATABASE_URL)
     await db.execute("""
         CREATE TABLE IF NOT EXISTS messages (
-            id          INTEGER PRIMARY KEY,
-            author      TEXT    NOT NULL,
-            author_id   INTEGER NOT NULL,
-            channel     TEXT    NOT NULL,
+            id          BIGINT PRIMARY KEY,
+            author      TEXT NOT NULL,
+            author_id   BIGINT NOT NULL,
+            channel     TEXT NOT NULL,
             guild_name  TEXT,
             content     TEXT,
-            created_at  TEXT    NOT NULL,
+            created_at  TEXT NOT NULL,
             attachments TEXT,
             stickers    TEXT,
             avatar_url  TEXT
         )
     """)
-    # Migrate existing DBs that predate the avatar_url column.
-    try:
-        await db.execute("ALTER TABLE messages ADD COLUMN avatar_url TEXT")
-    except Exception:
-        pass
     await db.execute("""
         CREATE TABLE IF NOT EXISTS mirror_queue (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            message_id  INTEGER NOT NULL,
-            webhook_url TEXT    NOT NULL,
+            id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            message_id  BIGINT NOT NULL,
+            webhook_url TEXT NOT NULL,
             UNIQUE(message_id, webhook_url)
         )
     """)
-    await db.commit()
 
     mirror_session = aiohttp.ClientSession()
     mirror_worker = asyncio.create_task(

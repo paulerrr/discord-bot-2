@@ -1,4 +1,4 @@
 discord.py-self
 aiohttp
-aiosqlite
+asyncpg
 python-dotenv
