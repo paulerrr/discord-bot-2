@@ -161,20 +161,27 @@ async def _post_worker() -> None:
             _post_queue.task_done()
 
 
+def _att_path(att: dict, fallback_dir: Path, msg_id: int) -> Path:
+    """Resolve attachment local path; falls back for pre-migration records without local_path."""
+    if "local_path" in att:
+        return MEDIA_DIR / att["local_path"]
+    return fallback_dir / f"{msg_id}_{att['filename']}"
+
+
 async def _save_attachment(session: aiohttp.ClientSession,
                             message: discord.Message,
-                            attachment: discord.Attachment) -> Path | None:
+                            attachment: discord.Attachment) -> str | None:
     guild_dir = MEDIA_DIR / (str(message.guild.id) if message.guild else "DMs")
     guild_dir.mkdir(parents=True, exist_ok=True)
     dest = guild_dir / f"{message.id}_{attachment.filename}"
     if dest.exists():
-        return dest
+        return str(dest.relative_to(MEDIA_DIR))
     try:
         async with _download_sem:
             async with session.get(attachment.url) as resp:
                 if resp.status == 200:
                     dest.write_bytes(await resp.read())
-                    return dest
+                    return str(dest.relative_to(MEDIA_DIR))
     except Exception as exc:
         console.warning("Failed to save attachment %s: %s", attachment.filename, exc)
     return None
@@ -182,7 +189,7 @@ async def _save_attachment(session: aiohttp.ClientSession,
 
 async def _save_sticker(session: aiohttp.ClientSession,
                          message: discord.Message,
-                         sticker: discord.StickerItem) -> Path | None:
+                         sticker: discord.StickerItem) -> str | None:
     if sticker.format == discord.StickerFormatType.lottie:
         return None  # JSON, not a viewable image
     guild_dir = MEDIA_DIR / (str(message.guild.id) if message.guild else "DMs") / "stickers"
@@ -190,13 +197,13 @@ async def _save_sticker(session: aiohttp.ClientSession,
     ext = "gif" if sticker.format == discord.StickerFormatType.gif else "png"
     dest = guild_dir / f"{sticker.id}.{ext}"
     if dest.exists():
-        return dest
+        return str(dest.relative_to(MEDIA_DIR))
     try:
         async with _download_sem:
             async with session.get(sticker.url) as resp:
                 if resp.status == 200:
                     dest.write_bytes(await resp.read())
-                    return dest
+                    return str(dest.relative_to(MEDIA_DIR))
     except Exception as exc:
         console.warning("Failed to save sticker %s: %s", sticker.name, exc)
     return None
@@ -232,11 +239,13 @@ class MessageLogger(discord.Client):
             await self._session.close()
         await super().close()
 
-    async def _cache_message(self, message: discord.Message) -> None:
-        attachments = json.dumps([
+    async def _cache_message(self, message: discord.Message,
+                              attachments: list[dict] | None = None,
+                              stickers: list[dict] | None = None) -> None:
+        attachments = json.dumps(attachments if attachments is not None else [
             {"filename": a.filename, "url": a.url} for a in message.attachments
         ])
-        stickers = json.dumps([
+        stickers = json.dumps(stickers if stickers is not None else [
             {"id": s.id, "name": s.name, "format": s.format.name} for s in message.stickers
         ])
         await self._db.execute(
@@ -338,7 +347,23 @@ class MessageLogger(discord.Client):
         if self._log_channel and message.channel.id == self._log_channel.id:
             return
 
-        await self._cache_message(message)
+        att_records: list[dict] = []
+        for att in message.attachments:
+            local = await _save_attachment(self._session, message, att)
+            rec: dict = {"filename": att.filename, "url": att.url}
+            if local:
+                rec["local_path"] = local
+            att_records.append(rec)
+
+        stk_records: list[dict] = []
+        for s in message.stickers:
+            local = await _save_sticker(self._session, message, s)
+            rec = {"id": s.id, "name": s.name, "format": s.format.name}
+            if local:
+                rec["local_path"] = local
+            stk_records.append(rec)
+
+        await self._cache_message(message, att_records, stk_records)
 
         date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         path = _log_path(_guild_name(message), str(message.channel), date)
@@ -350,18 +375,16 @@ class MessageLogger(discord.Client):
             f"  {message.content}\n" if message.content else "",
         ]
 
-        if message.attachments:
-            lines.append(f"  Attachments: {len(message.attachments)}\n")
-            for att in message.attachments:
-                saved = await _save_attachment(self._session, message, att)
-                local = f"  →  {saved}" if saved else ""
-                lines.append(f"    - {att.filename}  ({att.url}){local}\n")
+        if att_records:
+            lines.append(f"  Attachments: {len(att_records)}\n")
+            for rec in att_records:
+                local_label = f"  →  {rec['local_path']}" if "local_path" in rec else ""
+                lines.append(f"    - {rec['filename']}  ({rec['url']}){local_label}\n")
 
-        if message.stickers:
-            lines.append(f"  Stickers: {len(message.stickers)}\n")
-            for s in message.stickers:
-                await _save_sticker(self._session, message, s)
-                lines.append(f"    - {s.name} (id: {s.id}, format: {s.format.name})\n")
+        if stk_records:
+            lines.append(f"  Stickers: {len(stk_records)}\n")
+            for rec in stk_records:
+                lines.append(f"    - {rec['name']} (id: {rec['id']}, format: {rec['format']})\n")
 
         if message.embeds:
             lines.append(f"  Embeds: {len(message.embeds)}\n")
@@ -387,7 +410,20 @@ class MessageLogger(discord.Client):
         if before.content == after.content:
             return  # pin, embed-load, etc. — not a real edit
 
-        await self._cache_message(after)
+        existing = await self._db.fetchrow(
+            "SELECT attachments, stickers FROM messages WHERE id = $1", before.id
+        )
+        att_records: list[dict] = (
+            json.loads(existing["attachments"])
+            if existing and existing["attachments"]
+            else [{"filename": a.filename, "url": a.url} for a in after.attachments]
+        )
+        stk_records: list[dict] = (
+            json.loads(existing["stickers"])
+            if existing and existing["stickers"]
+            else [{"id": s.id, "name": s.name, "format": s.format.name} for s in after.stickers]
+        )
+        await self._cache_message(after, att_records, stk_records)
 
         date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         path = _log_path(_guild_name(after), str(after.channel), date)
@@ -403,8 +439,8 @@ class MessageLogger(discord.Client):
         guild_dir = MEDIA_DIR / (str(after.guild.id) if after.guild else "DMs")
         files = [
             discord.File(p)
-            for att in before.attachments
-            if (p := guild_dir / f"{before.id}_{att.filename}").exists()
+            for att in att_records
+            if (p := _att_path(att, guild_dir, before.id)).exists()
         ]
         edited_ts = int((after.edited_at or datetime.now(timezone.utc)).timestamp())
         channel_post = "\n".join([
@@ -420,6 +456,8 @@ class MessageLogger(discord.Client):
 
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
         if not self._is_watched_guild(payload.guild_id):
+            return
+        if self._log_channel and payload.channel_id == self._log_channel.id:
             return
 
         cached = await self._pop_cached(payload.message_id)
@@ -473,8 +511,8 @@ class MessageLogger(discord.Client):
         if cached.attachments:
             lines.append(f"  Attachments ({len(cached.attachments)}):\n")
             for att in cached.attachments:
-                local = guild_dir / f"{cached.id}_{att['filename']}"
-                label = str(local) if local.exists() else att['url']
+                local = _att_path(att, guild_dir, cached.id)
+                label = str(local.relative_to(MEDIA_DIR)) if local.exists() else att['url']
                 lines.append(f"    - {att['filename']}  →  {label}\n")
 
         if cached.stickers:
@@ -487,11 +525,14 @@ class MessageLogger(discord.Client):
         files = [
             discord.File(p)
             for att in cached.attachments
-            if (p := guild_dir / f"{cached.id}_{att['filename']}").exists()
+            if (p := _att_path(att, guild_dir, cached.id)).exists()
         ]
         for s in cached.stickers:
             ext = "gif" if s["format"].lower() == "gif" else "png"
-            p = guild_dir / "stickers" / f"{s['id']}.{ext}"
+            if "local_path" in s:
+                p = MEDIA_DIR / s["local_path"]
+            else:
+                p = guild_dir / "stickers" / f"{s['id']}.{ext}"
             if p.exists():
                 files.append(discord.File(p, filename=f"{s['name']}.{ext}"))
         sent_ts = int(cached.created_at.timestamp())
@@ -511,6 +552,8 @@ class MessageLogger(discord.Client):
 
     async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent) -> None:
         if not self._is_watched_guild(payload.guild_id):
+            return
+        if self._log_channel and payload.channel_id == self._log_channel.id:
             return
 
         dpy_cached: dict[int, discord.Message] = {m.id: m for m in payload.cached_messages}
