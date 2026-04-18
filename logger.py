@@ -488,6 +488,19 @@ class MessageLogger(discord.Client):
         global _log_poster, _ready_count
         label = "poster" if self._poster_only else f"token[{self._token_index}]"
         console.info("%s: logged in as %s (id: %s)", label, self.user, self.user.id)
+
+        token = LOG_POSTER_TOKEN if self._poster_only else TOKENS[self._token_index]
+        await self._db.execute(
+            """INSERT INTO accounts (user_id, username, avatar_url, token, poster_only, token_index)
+               VALUES ($1, $2, $3, $4, $5, $6)
+               ON CONFLICT (user_id) DO UPDATE SET
+                   username=EXCLUDED.username, avatar_url=EXCLUDED.avatar_url,
+                   token=EXCLUDED.token, poster_only=EXCLUDED.poster_only,
+                   token_index=EXCLUDED.token_index""",
+            self.user.id, str(self.user), str(self.user.display_avatar.url),
+            token, self._poster_only, None if self._poster_only else self._token_index,
+        )
+
         if self._poster_only:
             for guild in self.guilds:
                 _guild_client.setdefault(guild.id, self)
@@ -987,6 +1000,16 @@ async def main() -> None:
             id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             webhook_url TEXT NOT NULL,
             content     TEXT NOT NULL
+        )
+    """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS accounts (
+            user_id     BIGINT PRIMARY KEY,
+            username    TEXT NOT NULL,
+            avatar_url  TEXT,
+            token       TEXT NOT NULL,
+            poster_only BOOLEAN NOT NULL DEFAULT FALSE,
+            token_index INT
         )
     """)
 
