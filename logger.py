@@ -244,6 +244,7 @@ async def _ensure_server_mirror_channel(
     db: asyncpg.Pool,
     dst_guild: discord.Guild,
     src_channel: discord.TextChannel,
+    category_cache: dict[str, discord.CategoryChannel],
 ) -> None:
     """Create (if needed) a matching channel + webhook in dst_guild for src_channel,
     then record the mapping in server_mirror_channels. Idempotent."""
@@ -258,10 +259,11 @@ async def _ensure_server_mirror_channel(
     if dst_channel is None:
         dst_category: discord.CategoryChannel | None = None
         if src_channel.category:
-            dst_category = discord.utils.get(dst_guild.categories, name=src_channel.category.name)
+            dst_category = category_cache.get(src_channel.category.name) or discord.utils.get(dst_guild.categories, name=src_channel.category.name)
             if dst_category is None:
                 try:
                     dst_category = await dst_guild.create_category(src_channel.category.name)
+                    category_cache[src_channel.category.name] = dst_category
                     console.info("Server mirror: created category '%s' in %s", src_channel.category.name, dst_guild.name)
                 except Exception as exc:
                     console.warning("Server mirror: could not create category '%s': %s", src_channel.category.name, exc)
@@ -300,6 +302,7 @@ async def _ensure_server_mirror_voice_channel(
     db: asyncpg.Pool,
     dst_guild: discord.Guild,
     src_channel: discord.VoiceChannel,
+    category_cache: dict[str, discord.CategoryChannel],
 ) -> None:
     """Create a matching text channel + webhook in dst_guild for src_channel (voice),
     then record the mapping. Idempotent."""
@@ -314,10 +317,11 @@ async def _ensure_server_mirror_voice_channel(
     if dst_channel is None:
         dst_category: discord.CategoryChannel | None = None
         if src_channel.category:
-            dst_category = discord.utils.get(dst_guild.categories, name=src_channel.category.name)
+            dst_category = category_cache.get(src_channel.category.name) or discord.utils.get(dst_guild.categories, name=src_channel.category.name)
             if dst_category is None:
                 try:
                     dst_category = await dst_guild.create_category(src_channel.category.name)
+                    category_cache[src_channel.category.name] = dst_category
                     console.info("Server mirror: created category '%s' in %s", src_channel.category.name, dst_guild.name)
                 except Exception as exc:
                     console.warning("Server mirror: could not create category '%s': %s", src_channel.category.name, exc)
@@ -370,10 +374,11 @@ async def _setup_server_mirrors(db: asyncpg.Pool) -> None:
             continue
         console.info("Server mirror: setting up %s → %s (%d text, %d voice channels)",
                      src_guild.name, dst_guild.name, len(src_guild.text_channels), len(src_guild.voice_channels))
+        category_cache: dict[str, discord.CategoryChannel] = {}
         for channel in src_guild.text_channels:
-            await _ensure_server_mirror_channel(db, dst_guild, channel)
+            await _ensure_server_mirror_channel(db, dst_guild, channel, category_cache)
         for channel in src_guild.voice_channels:
-            await _ensure_server_mirror_voice_channel(db, dst_guild, channel)
+            await _ensure_server_mirror_voice_channel(db, dst_guild, channel, category_cache)
 
 
 # ── Client ────────────────────────────────────────────────────────────────────
