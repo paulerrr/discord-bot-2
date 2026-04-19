@@ -653,13 +653,15 @@ class MessageLogger(discord.Client):
 
         if not self._poster_only and message.channel.id in MIRROR_MAP:
             if not message.guild or _guild_owner.get(message.guild.id) == id(self):
+                reply_to: int | None = message.reference.message_id if message.reference else None
                 for wurl in MIRROR_MAP[message.channel.id]:
                     await self._db.execute(
-                        "INSERT INTO mirror_queue (message_id, webhook_url) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                        message.id, wurl,
+                        "INSERT INTO mirror_queue (message_id, webhook_url, reply_to) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                        message.id, wurl, reply_to,
                     )
 
         if message.guild and message.guild.id in _server_mirror_src:
+            reply_to_srv: int | None = message.reference.message_id if message.reference else None
             row = await self._db.fetchrow(
                 "SELECT webhook_url, dest_channel_id FROM server_mirror_channels WHERE source_channel_id = $1",
                 message.channel.id,
@@ -667,8 +669,8 @@ class MessageLogger(discord.Client):
             if row:
                 dest_thread_id = row["dest_channel_id"] if isinstance(message.channel, discord.Thread) else None
                 await self._db.execute(
-                    "INSERT INTO mirror_queue (message_id, webhook_url, dest_thread_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-                    message.id, row["webhook_url"], dest_thread_id,
+                    "INSERT INTO mirror_queue (message_id, webhook_url, dest_thread_id, reply_to) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                    message.id, row["webhook_url"], dest_thread_id, reply_to_srv,
                 )
             elif isinstance(message.channel, discord.Thread) and isinstance(message.channel.parent, discord.ForumChannel):
                 forum_row = await self._db.fetchrow(
@@ -1023,7 +1025,7 @@ async def _mirror_worker(db: asyncpg.Pool, session: aiohttp.ClientSession) -> No
     """Reads mirror_queue rows and posts each to its webhook with spoofed identity."""
     while True:
         row = await db.fetchrow(
-            """SELECT q.id, q.webhook_url, q.dest_thread_id,
+            """SELECT q.id, q.webhook_url, q.dest_thread_id, q.reply_to,
                       m.author, m.avatar_url, m.content, m.attachments, m.stickers
                FROM mirror_queue q
                JOIN messages m ON q.message_id = m.id
@@ -1047,7 +1049,7 @@ async def _mirror_worker(db: asyncpg.Pool, session: aiohttp.ClientSession) -> No
             await asyncio.sleep(0.5)
             continue
 
-        queue_id, webhook_url, dest_thread_id, author, avatar_url, content, attachments_json, stickers_json = row
+        queue_id, webhook_url, dest_thread_id, reply_to, author, avatar_url, content, attachments_json, stickers_json = row
         attachments: list[dict] = json.loads(attachments_json) if attachments_json else []
         stickers: list[dict] = json.loads(stickers_json) if stickers_json else []
 
@@ -1076,6 +1078,15 @@ async def _mirror_worker(db: asyncpg.Pool, session: aiohttp.ClientSession) -> No
                 extra_urls.append(f"https://media.discordapp.net/stickers/{s['id']}.webp")
 
             post_content = content or ""
+            if reply_to is not None:
+                ref_row = await db.fetchrow(
+                    "SELECT author, content FROM messages WHERE id = $1", reply_to
+                )
+                if ref_row:
+                    ref_preview = (ref_row["content"] or "")[:100]
+                    if len(ref_row["content"] or "") > 100:
+                        ref_preview += "…"
+                    post_content = f"> **{ref_row['author']}**: {ref_preview}\n{post_content}"
             if extra_urls:
                 post_content = (post_content + "\n" + "\n".join(extra_urls)).strip()
 
@@ -1156,6 +1167,9 @@ async def main() -> None:
     """)
     await db.execute(
         "ALTER TABLE mirror_queue ADD COLUMN IF NOT EXISTS dest_thread_id BIGINT"
+    )
+    await db.execute(
+        "ALTER TABLE mirror_queue ADD COLUMN IF NOT EXISTS reply_to BIGINT"
     )
 
     mirror_session = aiohttp.ClientSession()
