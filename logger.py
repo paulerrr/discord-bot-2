@@ -1025,7 +1025,7 @@ async def _mirror_worker(db: asyncpg.Pool, session: aiohttp.ClientSession) -> No
     """Reads mirror_queue rows and posts each to its webhook with spoofed identity."""
     while True:
         row = await db.fetchrow(
-            """SELECT q.id, q.webhook_url, q.dest_thread_id, q.reply_to,
+            """SELECT q.id, q.message_id, q.webhook_url, q.dest_thread_id, q.reply_to,
                       m.author, m.avatar_url, m.content, m.attachments, m.stickers
                FROM mirror_queue q
                JOIN messages m ON q.message_id = m.id
@@ -1049,7 +1049,7 @@ async def _mirror_worker(db: asyncpg.Pool, session: aiohttp.ClientSession) -> No
             await asyncio.sleep(0.5)
             continue
 
-        queue_id, webhook_url, dest_thread_id, reply_to, author, avatar_url, content, attachments_json, stickers_json = row
+        queue_id, source_message_id, webhook_url, dest_thread_id, reply_to, author, avatar_url, content, attachments_json, stickers_json = row
         attachments: list[dict] = json.loads(attachments_json) if attachments_json else []
         stickers: list[dict] = json.loads(stickers_json) if stickers_json else []
 
@@ -1083,19 +1083,32 @@ async def _mirror_worker(db: asyncpg.Pool, session: aiohttp.ClientSession) -> No
                     "SELECT author, content FROM messages WHERE id = $1", reply_to
                 )
                 if ref_row:
-                    ref_preview = (ref_row["content"] or "")[:100]
-                    if len(ref_row["content"] or "") > 100:
+                    ref_full = ref_row["content"] or ""
+                    ref_preview = ref_full[:100]
+                    if len(ref_full) > 100:
                         ref_preview += "…"
+                        jump_row = await db.fetchrow(
+                            "SELECT jump_url FROM mirror_message_map WHERE source_message_id = $1 AND webhook_url = $2",
+                            reply_to, webhook_url,
+                        )
+                        if jump_row:
+                            ref_preview += f" [↗]({jump_row['jump_url']})"
                     post_content = f"> **{ref_row['author']}**: {ref_preview}\n{post_content}"
             if extra_urls:
                 post_content = (post_content + "\n" + "\n".join(extra_urls)).strip()
 
-            await wh.send(
+            sent = await wh.send(
                 content=post_content or "\u200b",
                 username=author,
                 avatar_url=avatar_url,
                 files=files or discord.utils.MISSING,
                 thread=discord.Object(id=dest_thread_id) if dest_thread_id else discord.utils.MISSING,
+                wait=True,
+            )
+            await db.execute(
+                """INSERT INTO mirror_message_map (source_message_id, webhook_url, jump_url)
+                   VALUES ($1, $2, $3) ON CONFLICT DO NOTHING""",
+                source_message_id, webhook_url, sent.jump_url,
             )
             console.info("Mirrored message to %s", webhook_url[:40])
         except Exception as exc:
@@ -1171,6 +1184,14 @@ async def main() -> None:
     await db.execute(
         "ALTER TABLE mirror_queue ADD COLUMN IF NOT EXISTS reply_to BIGINT"
     )
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS mirror_message_map (
+            source_message_id BIGINT NOT NULL,
+            webhook_url       TEXT   NOT NULL,
+            jump_url          TEXT   NOT NULL,
+            PRIMARY KEY (source_message_id, webhook_url)
+        )
+    """)
 
     mirror_session = aiohttp.ClientSession()
     mirror_worker = asyncio.create_task(
