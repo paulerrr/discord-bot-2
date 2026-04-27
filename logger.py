@@ -850,9 +850,16 @@ class MessageLogger(discord.Client):
 
         mirror_urls = await _mirror_webhooks_for_channel(self._db, payload.channel_id)
         for wurl in mirror_urls:
+            jump_row = await self._db.fetchrow(
+                "SELECT jump_url FROM mirror_message_map WHERE source_message_id = $1 AND webhook_url = $2",
+                payload.message_id, wurl,
+            )
+            notif = f"🗑️ **{discord.utils.escape_markdown(cached.author)}** deleted their message"
+            if jump_row:
+                notif += f" — [jump to mirror]({jump_row['jump_url']})"
             await self._db.execute(
                 "INSERT INTO mirror_notifications (webhook_url, content) VALUES ($1, $2)",
-                wurl, f"🗑️ **{discord.utils.escape_markdown(cached.author)}** deleted their message",
+                wurl, notif,
             )
 
         console.info("Delete logged: %s in %s", cached.author, channel_label)
@@ -1024,19 +1031,29 @@ async def _mirror_webhooks_for_channel(db: asyncpg.Pool, channel_id: int) -> lis
 async def _mirror_worker(db: asyncpg.Pool, session: aiohttp.ClientSession) -> None:
     """Reads mirror_queue rows and posts each to its webhook with spoofed identity."""
     while True:
-        row = await db.fetchrow(
-            """SELECT q.id, q.message_id, q.webhook_url, q.dest_thread_id, q.reply_to,
-                      m.author, m.avatar_url, m.content, m.attachments, m.stickers
-               FROM mirror_queue q
-               JOIN messages m ON q.message_id = m.id
-               ORDER BY q.id
-               LIMIT 1"""
-        )
+        try:
+            row = await db.fetchrow(
+                """SELECT q.id, q.message_id, q.webhook_url, q.dest_thread_id, q.reply_to,
+                          m.author, m.avatar_url, m.content, m.attachments, m.stickers
+                   FROM mirror_queue q
+                   JOIN messages m ON q.message_id = m.id
+                   ORDER BY q.id
+                   LIMIT 1"""
+            )
+        except Exception as exc:
+            console.warning("Mirror worker: DB fetch error: %s", exc)
+            await asyncio.sleep(5.0)
+            continue
 
         if row is None:
-            notif = await db.fetchrow(
-                "SELECT id, webhook_url, content FROM mirror_notifications ORDER BY id LIMIT 1"
-            )
+            try:
+                notif = await db.fetchrow(
+                    "SELECT id, webhook_url, content FROM mirror_notifications ORDER BY id LIMIT 1"
+                )
+            except Exception as exc:
+                console.warning("Mirror worker: DB fetch error (notifications): %s", exc)
+                await asyncio.sleep(5.0)
+                continue
             if notif is not None:
                 try:
                     wh = discord.Webhook.from_url(notif["webhook_url"], session=session)
