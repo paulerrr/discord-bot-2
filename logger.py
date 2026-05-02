@@ -1032,107 +1032,122 @@ async def _mirror_worker(db: asyncpg.Pool, session: aiohttp.ClientSession) -> No
     """Reads mirror_queue rows and posts each to its webhook with spoofed identity."""
     while True:
         try:
-            row = await db.fetchrow(
-                """SELECT q.id, q.message_id, q.webhook_url, q.dest_thread_id, q.reply_to,
-                          m.author, m.avatar_url, m.content, m.attachments, m.stickers
-                   FROM mirror_queue q
-                   JOIN messages m ON q.message_id = m.id
-                   ORDER BY q.id
-                   LIMIT 1"""
+            await _mirror_worker_tick(db, session)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            console.warning("Mirror worker: unexpected error, restarting: %s", exc)
+            await asyncio.sleep(5.0)
+
+
+async def _mirror_worker_tick(db: asyncpg.Pool, session: aiohttp.ClientSession) -> None:
+    try:
+        row = await db.fetchrow(
+            """SELECT q.id, q.message_id, q.webhook_url, q.dest_thread_id, q.reply_to,
+                      m.author, m.avatar_url, m.content, m.attachments, m.stickers
+               FROM mirror_queue q
+               JOIN messages m ON q.message_id = m.id
+               ORDER BY q.id
+               LIMIT 1"""
+        )
+    except Exception as exc:
+        console.warning("Mirror worker: DB fetch error: %s", exc)
+        await asyncio.sleep(5.0)
+        return
+
+    if row is None:
+        try:
+            notif = await db.fetchrow(
+                "SELECT id, webhook_url, content FROM mirror_notifications ORDER BY id LIMIT 1"
             )
         except Exception as exc:
-            console.warning("Mirror worker: DB fetch error: %s", exc)
+            console.warning("Mirror worker: DB fetch error (notifications): %s", exc)
             await asyncio.sleep(5.0)
-            continue
-
-        if row is None:
+            return
+        if notif is not None:
             try:
-                notif = await db.fetchrow(
-                    "SELECT id, webhook_url, content FROM mirror_notifications ORDER BY id LIMIT 1"
-                )
+                wh = discord.Webhook.from_url(notif["webhook_url"], session=session)
+                await wh.send(content=notif["content"], username="Message Logger")
             except Exception as exc:
-                console.warning("Mirror worker: DB fetch error (notifications): %s", exc)
-                await asyncio.sleep(5.0)
-                continue
-            if notif is not None:
+                console.warning("Mirror notification to %s failed: %s", notif["webhook_url"][:40], exc)
+            finally:
                 try:
-                    wh = discord.Webhook.from_url(notif["webhook_url"], session=session)
-                    await wh.send(content=notif["content"], username="Message Logger")
-                except Exception as exc:
-                    console.warning("Mirror notification to %s failed: %s", notif["webhook_url"][:40], exc)
-                finally:
                     await db.execute("DELETE FROM mirror_notifications WHERE id = $1", notif["id"])
-                continue
-            await asyncio.sleep(0.5)
-            continue
+                except Exception as exc:
+                    console.warning("Mirror worker: failed to delete notification %s: %s", notif["id"], exc)
+            return
+        await asyncio.sleep(0.5)
+        return
 
-        queue_id, source_message_id, webhook_url, dest_thread_id, reply_to, author, avatar_url, content, attachments_json, stickers_json = row
-        attachments: list[dict] = json.loads(attachments_json) if attachments_json else []
-        stickers: list[dict] = json.loads(stickers_json) if stickers_json else []
+    queue_id, source_message_id, webhook_url, dest_thread_id, reply_to, author, avatar_url, content, attachments_json, stickers_json = row
+    attachments: list[dict] = json.loads(attachments_json) if attachments_json else []
+    stickers: list[dict] = json.loads(stickers_json) if stickers_json else []
 
-        try:
-            wh = discord.Webhook.from_url(webhook_url, session=session)
-            files: list[discord.File] = []
-            extra_urls: list[str] = []
+    try:
+        wh = discord.Webhook.from_url(webhook_url, session=session)
+        files: list[discord.File] = []
+        extra_urls: list[str] = []
 
-            for att in attachments:
-                try:
-                    async with _download_sem:
-                        async with session.get(att["url"]) as resp:
-                            if resp.status == 200:
-                                data = await resp.read()
-                                if len(data) < 8 * 1024 * 1024:
-                                    files.append(discord.File(io.BytesIO(data), filename=att["filename"]))
-                                else:
-                                    extra_urls.append(att["url"])
+        for att in attachments:
+            try:
+                async with _download_sem:
+                    async with session.get(att["url"], timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                        if resp.status == 200:
+                            data = await resp.read()
+                            if len(data) < 8 * 1024 * 1024:
+                                files.append(discord.File(io.BytesIO(data), filename=att["filename"]))
                             else:
                                 extra_urls.append(att["url"])
-                except Exception as exc:
-                    console.warning("Mirror attachment fetch failed (%s): %s", att["filename"], exc)
-                    extra_urls.append(att["url"])
+                        else:
+                            extra_urls.append(att["url"])
+            except Exception as exc:
+                console.warning("Mirror attachment fetch failed (%s): %s", att["filename"], exc)
+                extra_urls.append(att["url"])
 
-            for s in stickers:
-                extra_urls.append(f"https://media.discordapp.net/stickers/{s['id']}.webp")
+        for s in stickers:
+            extra_urls.append(f"https://media.discordapp.net/stickers/{s['id']}.webp")
 
-            post_content = content or ""
-            if reply_to is not None:
-                ref_row = await db.fetchrow(
-                    "SELECT author, content FROM messages WHERE id = $1", reply_to
+        post_content = content or ""
+        if reply_to is not None:
+            ref_row = await db.fetchrow(
+                "SELECT author, content FROM messages WHERE id = $1", reply_to
+            )
+            if ref_row:
+                ref_full = ref_row["content"] or ""
+                ref_preview = ref_full[:100]
+                if len(ref_full) > 100:
+                    ref_preview += "…"
+                jump_row = await db.fetchrow(
+                    "SELECT jump_url FROM mirror_message_map WHERE source_message_id = $1 AND webhook_url = $2",
+                    reply_to, webhook_url,
                 )
-                if ref_row:
-                    ref_full = ref_row["content"] or ""
-                    ref_preview = ref_full[:100]
-                    if len(ref_full) > 100:
-                        ref_preview += "…"
-                    jump_row = await db.fetchrow(
-                        "SELECT jump_url FROM mirror_message_map WHERE source_message_id = $1 AND webhook_url = $2",
-                        reply_to, webhook_url,
-                    )
-                    if jump_row:
-                        ref_preview += f" [↗]({jump_row['jump_url']})"
-                    post_content = f"> **{ref_row['author']}**: {ref_preview}\n{post_content}"
-            if extra_urls:
-                post_content = (post_content + "\n" + "\n".join(extra_urls)).strip()
+                if jump_row:
+                    ref_preview += f" [↗]({jump_row['jump_url']})"
+                post_content = f"> **{ref_row['author']}**: {ref_preview}\n{post_content}"
+        if extra_urls:
+            post_content = (post_content + "\n" + "\n".join(extra_urls)).strip()
 
-            sent = await wh.send(
-                content=post_content or "\u200b",
-                username=author,
-                avatar_url=avatar_url,
-                files=files or discord.utils.MISSING,
-                thread=discord.Object(id=dest_thread_id) if dest_thread_id else discord.utils.MISSING,
-                wait=True,
-            )
-            await db.execute(
-                """INSERT INTO mirror_message_map (source_message_id, webhook_url, jump_url)
-                   VALUES ($1, $2, $3) ON CONFLICT DO NOTHING""",
-                source_message_id, webhook_url, sent.jump_url,
-            )
-            console.info("Mirrored message to %s", webhook_url[:40])
-        except Exception as exc:
-            console.warning("Mirror post to %s failed: %s", webhook_url[:40], exc)
-        finally:
+        sent = await wh.send(
+            content=post_content or "​",
+            username=author,
+            avatar_url=avatar_url,
+            files=files or discord.utils.MISSING,
+            thread=discord.Object(id=dest_thread_id) if dest_thread_id else discord.utils.MISSING,
+            wait=True,
+        )
+        await db.execute(
+            """INSERT INTO mirror_message_map (source_message_id, webhook_url, jump_url)
+               VALUES ($1, $2, $3) ON CONFLICT DO NOTHING""",
+            source_message_id, webhook_url, sent.jump_url,
+        )
+        console.info("Mirrored message to %s", webhook_url[:40])
+    except Exception as exc:
+        console.warning("Mirror post to %s failed: %s", webhook_url[:40], exc)
+    finally:
+        try:
             await db.execute("DELETE FROM mirror_queue WHERE id = $1", queue_id)
-
+        except Exception as exc:
+            console.warning("Mirror worker: failed to delete queue item %s: %s", queue_id, exc)
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
