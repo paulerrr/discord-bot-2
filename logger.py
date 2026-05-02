@@ -16,7 +16,6 @@ load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-# Comma-separated tokens, one per account.
 TOKENS: list[str] = [
     t.strip()
     for t in os.environ.get("DISCORD_TOKENS", os.environ.get("DISCORD_TOKEN", "")).split(",")
@@ -25,22 +24,16 @@ TOKENS: list[str] = [
 if not TOKENS:
     raise RuntimeError("Set DISCORD_TOKENS (or DISCORD_TOKEN) in your .env")
 
-# Comma-separated guild IDs to watch across all accounts, or empty to watch all.
 WATCHED_GUILDS: list[int] = [
     int(g) for g in os.environ.get("WATCHED_GUILDS", "").split(",") if g.strip()
 ]
 
-# Optional channel ID to mirror log entries into Discord.
 LOG_CHANNEL_ID: int | None = (
     int(os.environ["LOG_CHANNEL_ID"]) if os.environ.get("LOG_CHANNEL_ID") else None
 )
 
-# Optional dedicated token whose sole job is posting to LOG_CHANNEL_ID.
-# This account does not need to be in any WATCHED_GUILDS.
 LOG_POSTER_TOKEN: str | None = os.environ.get("LOG_POSTER_TOKEN", "").strip() or None
 
-# channel_id:webhook_url pairs, comma-separated.
-# A channel can appear multiple times to fan out to multiple webhooks.
 MIRROR_MAP: dict[int, list[str]] = {}
 for _pair in os.environ.get("MIRROR_CHANNELS", "").split(","):
     _pair = _pair.strip()
@@ -51,8 +44,6 @@ for _pair in os.environ.get("MIRROR_CHANNELS", "").split(","):
     if _cid and _wurl:
         MIRROR_MAP.setdefault(int(_cid), []).append(_wurl)
 
-# source_guild_id:dest_guild_id pairs, comma-separated.
-# Bot auto-detects which token is in each guild and sets up channels/webhooks.
 MIRROR_SERVERS: list[tuple[int, int]] = []
 for _pair in os.environ.get("MIRROR_SERVERS", "").split(","):
     _pair = _pair.strip()
@@ -72,7 +63,6 @@ MEDIA_DIR = Path("media")
 BASE_LOG_DIR.mkdir(exist_ok=True)
 MEDIA_DIR.mkdir(exist_ok=True)
 
-# Internal discord.py library logs → logs/discord.log (rotating, 10 MiB × 3)
 _lib_handler = logging.handlers.RotatingFileHandler(
     BASE_LOG_DIR / "discord.log",
     encoding="utf-8",
@@ -86,7 +76,6 @@ _lib_handler.setFormatter(
 logging.getLogger("discord").addHandler(_lib_handler)
 logging.getLogger("discord").setLevel(logging.WARNING)
 
-# Application-level console logger
 console = logging.getLogger("message_logger")
 console.setLevel(logging.INFO)
 _ch = logging.StreamHandler()
@@ -120,6 +109,19 @@ def _write(path: Path, text: str) -> None:
         f.write(text)
 
 
+def _write_guild_name(guild: discord.Guild) -> None:
+    guild_dir = MEDIA_DIR / str(guild.id)
+    guild_dir.mkdir(parents=True, exist_ok=True)
+    (guild_dir / "!guild_name.txt").write_text(guild.name, encoding="utf-8")
+
+
+def _att_path(att: dict, fallback_dir: Path, msg_id: int) -> Path:
+    """Resolve attachment local path; falls back for pre-migration records without local_path."""
+    if "local_path" in att:
+        return MEDIA_DIR / att["local_path"]
+    return fallback_dir / f"{msg_id}_{att['filename']}"
+
+
 @dataclass
 class CachedMessage:
     id: int
@@ -129,33 +131,20 @@ class CachedMessage:
     guild_name: str | None
     content: str
     created_at: datetime
-    attachments: list[dict]  # [{filename, url}, ...]
-    stickers: list[dict]     # [{id, name, format}, ...]
+    attachments: list[dict]  # [{filename, url, ?local_path}, ...]
+    stickers: list[dict]     # [{id, name, format, ?local_path}, ...]
 
 
-# Maps guild_id → the client instance responsible for logging it.
-# First account to connect claims each guild; others skip it.
-_guild_owner: dict[int, int] = {}  # guild_id → id(client)
-
-# Maps guild_id → any client instance that is a member of that guild.
-# Used by server-mirror setup to find the right client for channel/webhook creation.
+_guild_owner: dict[int, int] = {}
 _guild_client: dict[int, "MessageLogger"] = {}
-
-# The first client that can see LOG_CHANNEL_ID claims it for posting.
-# This may differ from the guild owner if that account lacks channel access.
 _log_poster: "MessageLogger | None" = None
 
-# Serialises all log-channel posts; prevents burst rate-limit exposure.
 _post_queue: asyncio.Queue[tuple[str, list]] = asyncio.Queue()
-# Caps concurrent media downloads.
 _download_sem = asyncio.Semaphore(5)
 
-# Server-mirror ready coordination.
-_ready_count   = 0        # incremented each time a non-poster client fires on_ready
-_total_clients = 0        # set in main() before asyncio.gather
-_server_mirror_ready: asyncio.Event | None = None  # created in main()
-
-
+_ready_count   = 0
+_total_clients = 0
+_server_mirror_ready: asyncio.Event | None = None
 
 
 async def _post_worker() -> None:
@@ -182,18 +171,18 @@ async def _post_worker() -> None:
 
 async def _save_attachment(session: aiohttp.ClientSession,
                             message: discord.Message,
-                            attachment: discord.Attachment) -> Path | None:
+                            attachment: discord.Attachment) -> str | None:
     guild_dir = MEDIA_DIR / (str(message.guild.id) if message.guild else "DMs")
     guild_dir.mkdir(parents=True, exist_ok=True)
     dest = guild_dir / f"{message.id}_{attachment.filename}"
     if dest.exists():
-        return dest
+        return str(dest.relative_to(MEDIA_DIR))
     try:
         async with _download_sem:
             async with session.get(attachment.url) as resp:
                 if resp.status == 200:
                     dest.write_bytes(await resp.read())
-                    return dest
+                    return str(dest.relative_to(MEDIA_DIR))
     except Exception as exc:
         console.warning("Failed to save attachment %s: %s", attachment.filename, exc)
     return None
@@ -201,21 +190,21 @@ async def _save_attachment(session: aiohttp.ClientSession,
 
 async def _save_sticker(session: aiohttp.ClientSession,
                          message: discord.Message,
-                         sticker: discord.StickerItem) -> Path | None:
+                         sticker: discord.StickerItem) -> str | None:
     if sticker.format == discord.StickerFormatType.lottie:
-        return None  # JSON, not a viewable image
+        return None
     guild_dir = MEDIA_DIR / (str(message.guild.id) if message.guild else "DMs") / "stickers"
     guild_dir.mkdir(parents=True, exist_ok=True)
     ext = "gif" if sticker.format == discord.StickerFormatType.gif else "png"
     dest = guild_dir / f"{sticker.id}.{ext}"
     if dest.exists():
-        return dest
+        return str(dest.relative_to(MEDIA_DIR))
     try:
         async with _download_sem:
             async with session.get(sticker.url) as resp:
                 if resp.status == 200:
                     dest.write_bytes(await resp.read())
-                    return dest
+                    return str(dest.relative_to(MEDIA_DIR))
     except Exception as exc:
         console.warning("Failed to save sticker %s: %s", sticker.name, exc)
     return None
@@ -225,28 +214,26 @@ async def _save_sticker(session: aiohttp.ClientSession,
 
 async def _ensure_server_mirror_channel(
     db: aiosqlite.Connection,
-    dst_client: "MessageLogger",
     dst_guild: discord.Guild,
     src_channel: discord.TextChannel,
+    category_cache: dict[str, discord.CategoryChannel],
 ) -> None:
-    """Create (if needed) a matching channel + webhook in dst_guild for src_channel,
-    then record the mapping in server_mirror_channels. Idempotent."""
     async with db.execute(
         "SELECT webhook_url FROM server_mirror_channels WHERE source_channel_id = ?",
         (src_channel.id,),
     ) as cur:
         if await cur.fetchone():
-            return  # already mapped
+            return
 
-    # Find or create the destination channel.
     dst_channel = discord.utils.get(dst_guild.text_channels, name=src_channel.name)
     if dst_channel is None:
         dst_category: discord.CategoryChannel | None = None
         if src_channel.category:
-            dst_category = discord.utils.get(dst_guild.categories, name=src_channel.category.name)
+            dst_category = category_cache.get(src_channel.category.name) or discord.utils.get(dst_guild.categories, name=src_channel.category.name)
             if dst_category is None:
                 try:
                     dst_category = await dst_guild.create_category(src_channel.category.name)
+                    category_cache[src_channel.category.name] = dst_category
                     console.info("Server mirror: created category '%s' in %s", src_channel.category.name, dst_guild.name)
                 except Exception as exc:
                     console.warning("Server mirror: could not create category '%s': %s", src_channel.category.name, exc)
@@ -261,7 +248,6 @@ async def _ensure_server_mirror_channel(
             console.warning("Server mirror: could not create channel #%s: %s", src_channel.name, exc)
             return
 
-    # Find or create the webhook.
     try:
         webhooks = await dst_channel.webhooks()
         wh = discord.utils.get(webhooks, name="MessageMirror")
@@ -281,11 +267,10 @@ async def _ensure_server_mirror_channel(
 
 async def _ensure_server_mirror_voice_channel(
     db: aiosqlite.Connection,
-    dst_client: "MessageLogger",
     dst_guild: discord.Guild,
     src_channel: discord.VoiceChannel,
+    category_cache: dict[str, discord.CategoryChannel],
 ) -> None:
-    """Create a matching voice channel + webhook in dst_guild, and record the mapping."""
     async with db.execute(
         "SELECT webhook_url FROM server_mirror_channels WHERE source_channel_id = ?",
         (src_channel.id,),
@@ -297,10 +282,11 @@ async def _ensure_server_mirror_voice_channel(
     if dst_channel is None:
         dst_category: discord.CategoryChannel | None = None
         if src_channel.category:
-            dst_category = discord.utils.get(dst_guild.categories, name=src_channel.category.name)
+            dst_category = category_cache.get(src_channel.category.name) or discord.utils.get(dst_guild.categories, name=src_channel.category.name)
             if dst_category is None:
                 try:
                     dst_category = await dst_guild.create_category(src_channel.category.name)
+                    category_cache[src_channel.category.name] = dst_category
                     console.info("Server mirror: created category '%s' in %s", src_channel.category.name, dst_guild.name)
                 except Exception as exc:
                     console.warning("Server mirror: could not create category '%s': %s", src_channel.category.name, exc)
@@ -328,9 +314,60 @@ async def _ensure_server_mirror_voice_channel(
     await db.commit()
 
 
+async def _ensure_server_mirror_forum(
+    db: aiosqlite.Connection,
+    dst_guild: discord.Guild,
+    src_forum: discord.ForumChannel,
+    category_cache: dict[str, discord.CategoryChannel],
+) -> None:
+    async with db.execute(
+        "SELECT webhook_url FROM server_mirror_forums WHERE source_forum_id = ?",
+        (src_forum.id,),
+    ) as cur:
+        if await cur.fetchone():
+            return
+
+    dst_forum = discord.utils.get(dst_guild.forums, name=src_forum.name)
+    if dst_forum is None:
+        dst_category: discord.CategoryChannel | None = None
+        if src_forum.category:
+            dst_category = category_cache.get(src_forum.category.name) or discord.utils.get(dst_guild.categories, name=src_forum.category.name)
+            if dst_category is None:
+                try:
+                    dst_category = await dst_guild.create_category(src_forum.category.name)
+                    category_cache[src_forum.category.name] = dst_category
+                    console.info("Server mirror: created category '%s' in %s", src_forum.category.name, dst_guild.name)
+                except Exception as exc:
+                    console.warning("Server mirror: could not create category '%s': %s", src_forum.category.name, exc)
+        try:
+            dst_forum = await dst_guild.create_forum(
+                src_forum.name,
+                category=dst_category,
+                topic=src_forum.topic or "",
+            )
+            console.info("Server mirror: created forum #%s in %s", src_forum.name, dst_guild.name)
+        except Exception as exc:
+            console.warning("Server mirror: could not create forum #%s: %s", src_forum.name, exc)
+            return
+
+    try:
+        webhooks = await dst_forum.webhooks()
+        wh = discord.utils.get(webhooks, name="MessageMirror")
+        if wh is None:
+            wh = await dst_forum.create_webhook(name="MessageMirror")
+            console.info("Server mirror: created webhook in forum #%s (%s)", dst_forum.name, dst_guild.name)
+    except Exception as exc:
+        console.warning("Server mirror: could not create webhook in forum #%s: %s", dst_forum.name, exc)
+        return
+
+    await db.execute(
+        "INSERT OR REPLACE INTO server_mirror_forums (source_forum_id, dest_forum_id, webhook_url) VALUES (?, ?, ?)",
+        (src_forum.id, dst_forum.id, wh.url),
+    )
+    await db.commit()
+
+
 async def _setup_server_mirrors(db: aiosqlite.Connection) -> None:
-    """Wait for all clients to be ready, then set up channel/webhook mappings for each
-    MIRROR_SERVERS pair."""
     if not MIRROR_SERVERS or _server_mirror_ready is None:
         return
     await _server_mirror_ready.wait()
@@ -348,20 +385,25 @@ async def _setup_server_mirrors(db: aiosqlite.Connection) -> None:
         if src_guild is None or dst_guild is None:
             console.warning("Server mirror: guild object unavailable for %s→%s", src_guild_id, dst_guild_id)
             continue
-        console.info("Server mirror: setting up %s → %s (%d text, %d voice channels)",
-                     src_guild.name, dst_guild.name, len(src_guild.text_channels), len(src_guild.voice_channels))
+        console.info("Server mirror: setting up %s → %s (%d text, %d voice, %d forum channels)",
+                     src_guild.name, dst_guild.name, len(src_guild.text_channels),
+                     len(src_guild.voice_channels), len(src_guild.forums))
+        category_cache: dict[str, discord.CategoryChannel] = {}
         for channel in src_guild.text_channels:
-            await _ensure_server_mirror_channel(db, dst_client, dst_guild, channel)
+            await _ensure_server_mirror_channel(db, dst_guild, channel, category_cache)
         for channel in src_guild.voice_channels:
-            await _ensure_server_mirror_voice_channel(db, dst_client, dst_guild, channel)
+            await _ensure_server_mirror_voice_channel(db, dst_guild, channel, category_cache)
+        for channel in src_guild.forums:
+            await _ensure_server_mirror_forum(db, dst_guild, channel, category_cache)
 
 
 # ── Client ────────────────────────────────────────────────────────────────────
 
 class MessageLogger(discord.Client):
-    def __init__(self, db: aiosqlite.Connection, poster_only: bool = False) -> None:
+    def __init__(self, db: aiosqlite.Connection, token_index: int = 0, poster_only: bool = False) -> None:
         super().__init__()
         self._db = db
+        self._token_index = token_index
         self._poster_only = poster_only
         self._session: aiohttp.ClientSession | None = None
         self._log_channel: discord.TextChannel | None = None
@@ -386,11 +428,13 @@ class MessageLogger(discord.Client):
             await self._session.close()
         await super().close()
 
-    async def _cache_message(self, message: discord.Message) -> None:
-        attachments = json.dumps([
+    async def _cache_message(self, message: discord.Message,
+                              attachments: list[dict] | None = None,
+                              stickers: list[dict] | None = None) -> None:
+        att_json = json.dumps(attachments if attachments is not None else [
             {"filename": a.filename, "url": a.url} for a in message.attachments
         ])
-        stickers = json.dumps([
+        stk_json = json.dumps(stickers if stickers is not None else [
             {"id": s.id, "name": s.name, "format": s.format.name} for s in message.stickers
         ])
         await self._db.execute(
@@ -405,8 +449,8 @@ class MessageLogger(discord.Client):
                 message.guild.name if message.guild else None,
                 message.content,
                 message.created_at.isoformat(),
-                attachments,
-                stickers,
+                att_json,
+                stk_json,
                 str(message.author.display_avatar.url),
             ),
         )
@@ -461,7 +505,21 @@ class MessageLogger(discord.Client):
 
     async def on_ready(self) -> None:
         global _log_poster, _ready_count
-        console.info("Logged in as %s (id: %s)", self.user, self.user.id)
+        label = "poster" if self._poster_only else f"token[{self._token_index}]"
+        console.info("%s: logged in as %s (id: %s)", label, self.user, self.user.id)
+
+        token = LOG_POSTER_TOKEN if self._poster_only else TOKENS[self._token_index]
+        await self._db.execute(
+            """INSERT OR REPLACE INTO accounts
+               (user_id, username, avatar_url, token, poster_only, token_index)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                self.user.id, str(self.user), str(self.user.display_avatar.url),
+                token, self._poster_only, None if self._poster_only else self._token_index,
+            ),
+        )
+        await self._db.commit()
+
         if self._poster_only:
             for guild in self.guilds:
                 _guild_client.setdefault(guild.id, self)
@@ -471,7 +529,11 @@ class MessageLogger(discord.Client):
                     _log_poster = self
                     self._log_channel = ch
                     console.info("Log channel: #%s (%s) (dedicated poster: %s)", ch.name, ch.id, self.user)
+            _ready_count += 1
+            if _server_mirror_ready is not None and _ready_count >= _total_clients:
+                _server_mirror_ready.set()
             return
+
         claimed = []
         for guild in self.guilds:
             if guild.id not in _guild_owner:
@@ -496,7 +558,26 @@ class MessageLogger(discord.Client):
         if self._log_channel and message.channel.id == self._log_channel.id:
             return
 
-        await self._cache_message(message)
+        if message.guild:
+            _write_guild_name(message.guild)
+
+        att_records: list[dict] = []
+        for att in message.attachments:
+            local = await _save_attachment(self._session, message, att)
+            rec: dict = {"filename": att.filename, "url": att.url}
+            if local:
+                rec["local_path"] = local
+            att_records.append(rec)
+
+        stk_records: list[dict] = []
+        for s in message.stickers:
+            local = await _save_sticker(self._session, message, s)
+            rec = {"id": s.id, "name": s.name, "format": s.format.name}
+            if local:
+                rec["local_path"] = local
+            stk_records.append(rec)
+
+        await self._cache_message(message, att_records, stk_records)
 
         date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         path = _log_path(_guild_name(message), str(message.channel), date)
@@ -508,18 +589,16 @@ class MessageLogger(discord.Client):
             f"  {message.content}\n" if message.content else "",
         ]
 
-        if message.attachments:
-            lines.append(f"  Attachments: {len(message.attachments)}\n")
-            for att in message.attachments:
-                saved = await _save_attachment(self._session, message, att)
-                local = f"  →  {saved}" if saved else ""
-                lines.append(f"    - {att.filename}  ({att.url}){local}\n")
+        if att_records:
+            lines.append(f"  Attachments: {len(att_records)}\n")
+            for rec in att_records:
+                local_label = f"  →  {rec['local_path']}" if "local_path" in rec else ""
+                lines.append(f"    - {rec['filename']}  ({rec['url']}){local_label}\n")
 
-        if message.stickers:
-            lines.append(f"  Stickers: {len(message.stickers)}\n")
-            for s in message.stickers:
-                await _save_sticker(self._session, message, s)
-                lines.append(f"    - {s.name} (id: {s.id}, format: {s.format.name})\n")
+        if stk_records:
+            lines.append(f"  Stickers: {len(stk_records)}\n")
+            for rec in stk_records:
+                lines.append(f"    - {rec['name']} (id: {rec['id']}, format: {rec['format']})\n")
 
         if message.embeds:
             lines.append(f"  Embeds: {len(message.embeds)}\n")
@@ -529,25 +608,36 @@ class MessageLogger(discord.Client):
 
         if not self._poster_only and message.channel.id in MIRROR_MAP:
             if not message.guild or _guild_owner.get(message.guild.id) == id(self):
+                reply_to: int | None = message.reference.message_id if message.reference else None
                 for wurl in MIRROR_MAP[message.channel.id]:
                     await self._db.execute(
-                        "INSERT OR IGNORE INTO mirror_queue (message_id, webhook_url) VALUES (?, ?)",
-                        (message.id, wurl),
+                        "INSERT OR IGNORE INTO mirror_queue (message_id, webhook_url, reply_to) VALUES (?, ?, ?)",
+                        (message.id, wurl, reply_to),
                     )
                 await self._db.commit()
 
         if message.guild and message.guild.id in _server_mirror_src:
+            reply_to_srv: int | None = message.reference.message_id if message.reference else None
             async with self._db.execute(
-                "SELECT webhook_url FROM server_mirror_channels WHERE source_channel_id = ?",
+                "SELECT webhook_url, dest_channel_id FROM server_mirror_channels WHERE source_channel_id = ?",
                 (message.channel.id,),
             ) as cur:
                 row = await cur.fetchone()
             if row:
+                dest_thread_id = row[1] if isinstance(message.channel, discord.Thread) else None
                 await self._db.execute(
-                    "INSERT OR IGNORE INTO mirror_queue (message_id, webhook_url) VALUES (?, ?)",
-                    (message.id, row[0]),
+                    "INSERT OR IGNORE INTO mirror_queue (message_id, webhook_url, dest_thread_id, reply_to) VALUES (?, ?, ?, ?)",
+                    (message.id, row[0], dest_thread_id, reply_to_srv),
                 )
                 await self._db.commit()
+            elif isinstance(message.channel, discord.Thread) and isinstance(message.channel.parent, discord.ForumChannel):
+                async with self._db.execute(
+                    "SELECT webhook_url FROM server_mirror_forums WHERE source_forum_id = ?",
+                    (message.channel.parent_id,),
+                ) as cur:
+                    forum_row = await cur.fetchone()
+                if forum_row:
+                    await self._create_forum_thread_and_send(message, forum_row[0], att_records, stk_records)
 
     async def on_message_edit(self,
                                before: discord.Message,
@@ -557,9 +647,21 @@ class MessageLogger(discord.Client):
         if self._log_channel and after.channel.id == self._log_channel.id:
             return
         if before.content == after.content:
-            return  # pin, embed-load, etc. — not a real edit
+            return
 
-        await self._cache_message(after)
+        async with self._db.execute(
+            "SELECT attachments, stickers FROM messages WHERE id = ?", (before.id,)
+        ) as cur:
+            existing = await cur.fetchone()
+        att_records: list[dict] = (
+            json.loads(existing[0]) if existing and existing[0] else
+            [{"filename": a.filename, "url": a.url} for a in after.attachments]
+        )
+        stk_records: list[dict] = (
+            json.loads(existing[1]) if existing and existing[1] else
+            [{"id": s.id, "name": s.name, "format": s.format.name} for s in after.stickers]
+        )
+        await self._cache_message(after, att_records, stk_records)
 
         date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         path = _log_path(_guild_name(after), str(after.channel), date)
@@ -575,8 +677,8 @@ class MessageLogger(discord.Client):
         guild_dir = MEDIA_DIR / (str(after.guild.id) if after.guild else "DMs")
         files = [
             discord.File(p)
-            for att in before.attachments
-            if (p := guild_dir / f"{before.id}_{att.filename}").exists()
+            for att in att_records
+            if (p := _att_path(att, guild_dir, before.id)).exists()
         ]
         edited_ts = int((after.edited_at or datetime.now(timezone.utc)).timestamp())
         channel_post = "\n".join([
@@ -588,10 +690,27 @@ class MessageLogger(discord.Client):
             f"After: {discord.utils.escape_markdown(after.content)}",
         ])
         await self._log_to_channel(channel_post, files=files)
+
+        mirror_urls = await _mirror_webhooks_for_channel(self._db, after.channel.id)
+        for wurl in mirror_urls:
+            notif = "\n".join([
+                f"✏️ **{discord.utils.escape_markdown(str(after.author))}** edited their message",
+                f"Before: {discord.utils.escape_markdown(before.content)}",
+                f"After: {discord.utils.escape_markdown(after.content)}",
+            ])
+            await self._db.execute(
+                "INSERT INTO mirror_notifications (webhook_url, content) VALUES (?, ?)",
+                (wurl, notif),
+            )
+        if mirror_urls:
+            await self._db.commit()
+
         console.info("Edit logged: %s in %s", after.author, _channel_label(after))
 
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
         if not self._is_watched_guild(payload.guild_id):
+            return
+        if self._log_channel and payload.channel_id == self._log_channel.id:
             return
 
         cached = await self._pop_cached(payload.message_id)
@@ -628,6 +747,14 @@ class MessageLogger(discord.Client):
                 f"  Message ID: {payload.message_id}\n"
                 f"  Content: <unknown>\n\n"
             ))
+            mirror_urls = await _mirror_webhooks_for_channel(self._db, payload.channel_id)
+            for wurl in mirror_urls:
+                await self._db.execute(
+                    "INSERT INTO mirror_notifications (webhook_url, content) VALUES (?, ?)",
+                    (wurl, f"🗑️ A message was deleted (id: {payload.message_id})"),
+                )
+            if mirror_urls:
+                await self._db.commit()
             console.info("Delete logged (no cache): msg %s in %s", payload.message_id, channel_label)
             return
 
@@ -645,8 +772,8 @@ class MessageLogger(discord.Client):
         if cached.attachments:
             lines.append(f"  Attachments ({len(cached.attachments)}):\n")
             for att in cached.attachments:
-                local = guild_dir / f"{cached.id}_{att['filename']}"
-                label = str(local) if local.exists() else att['url']
+                local = _att_path(att, guild_dir, cached.id)
+                label = str(local.relative_to(MEDIA_DIR)) if local.exists() else att['url']
                 lines.append(f"    - {att['filename']}  →  {label}\n")
 
         if cached.stickers:
@@ -659,11 +786,11 @@ class MessageLogger(discord.Client):
         files = [
             discord.File(p)
             for att in cached.attachments
-            if (p := guild_dir / f"{cached.id}_{att['filename']}").exists()
+            if (p := _att_path(att, guild_dir, cached.id)).exists()
         ]
         for s in cached.stickers:
             ext = "gif" if s["format"].lower() == "gif" else "png"
-            p = guild_dir / "stickers" / f"{s['id']}.{ext}"
+            p = MEDIA_DIR / s["local_path"] if "local_path" in s else guild_dir / "stickers" / f"{s['id']}.{ext}"
             if p.exists():
                 files.append(discord.File(p, filename=f"{s['name']}.{ext}"))
         sent_ts = int(cached.created_at.timestamp())
@@ -679,10 +806,30 @@ class MessageLogger(discord.Client):
         if cached.stickers:
             post_lines.append("Stickers: " + "  ".join(s['name'] for s in cached.stickers))
         await self._log_to_channel("\n".join(post_lines), files=files)
+
+        mirror_urls = await _mirror_webhooks_for_channel(self._db, payload.channel_id)
+        for wurl in mirror_urls:
+            async with self._db.execute(
+                "SELECT jump_url FROM mirror_message_map WHERE source_message_id = ? AND webhook_url = ?",
+                (payload.message_id, wurl),
+            ) as cur:
+                jump_row = await cur.fetchone()
+            notif = f"🗑️ **{discord.utils.escape_markdown(cached.author)}** deleted their message"
+            if jump_row:
+                notif += f" — [jump to mirror]({jump_row[0]})"
+            await self._db.execute(
+                "INSERT INTO mirror_notifications (webhook_url, content) VALUES (?, ?)",
+                (wurl, notif),
+            )
+        if mirror_urls:
+            await self._db.commit()
+
         console.info("Delete logged: %s in %s", cached.author, channel_label)
 
     async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent) -> None:
         if not self._is_watched_guild(payload.guild_id):
+            return
+        if self._log_channel and payload.channel_id == self._log_channel.id:
             return
 
         dpy_cached: dict[int, discord.Message] = {m.id: m for m in payload.cached_messages}
@@ -736,7 +883,6 @@ class MessageLogger(discord.Client):
             log_lines.append("\n")
             _write(path, "".join(log_lines))
 
-        # One summary post instead of N individual posts.
         post_lines = [
             f"🗑️ Bulk Delete ({len(payload.message_ids)} messages)",
             f"Channel: {channel_label}" + (f"  ·  {guild_name}" if guild_name else ""),
@@ -753,56 +899,23 @@ class MessageLogger(discord.Client):
         await self._log_to_channel("\n".join(post_lines))
         console.info("Bulk delete: %d messages", len(payload.message_ids))
 
-    async def on_guild_channel_create(self, channel: discord.abc.GuildChannel) -> None:
-        if not isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
-            return
-        for src_id, dst_id in MIRROR_SERVERS:
-            if channel.guild.id == src_id:
-                dst_client = _guild_client.get(dst_id)
-                if dst_client:
-                    dst_guild = dst_client.get_guild(dst_id)
-                    if dst_guild:
-                        if isinstance(channel, discord.TextChannel):
-                            await _ensure_server_mirror_channel(self._db, dst_client, dst_guild, channel)
-                        else:
-                            await _ensure_server_mirror_voice_channel(self._db, dst_client, dst_guild, channel)
-                break
-
-    async def on_error(self, event: str, *args, **kwargs) -> None:  # type: ignore[override]
-        import traceback
-        console.error("Error in %s:\n%s", event, traceback.format_exc())
-
-
-async def _mirror_worker(db: aiosqlite.Connection, session: aiohttp.ClientSession) -> None:
-    """Reads mirror_queue rows and posts each to its webhook with spoofed identity."""
-    while True:
-        async with db.execute(
-            """SELECT q.id, q.webhook_url,
-                      m.author, m.avatar_url, m.content, m.attachments, m.stickers
-               FROM mirror_queue q
-               JOIN messages m ON q.message_id = m.id
-               ORDER BY q.id
-               LIMIT 1"""
-        ) as cursor:
-            row = await cursor.fetchone()
-
-        if row is None:
-            await asyncio.sleep(0.5)
-            continue
-
-        queue_id, webhook_url, author, avatar_url, content, attachments_json, stickers_json = row
-        attachments: list[dict] = json.loads(attachments_json) if attachments_json else []
-        stickers: list[dict] = json.loads(stickers_json) if stickers_json else []
-
+    async def _create_forum_thread_and_send(
+        self,
+        message: discord.Message,
+        webhook_url: str,
+        att_records: list[dict],
+        stk_records: list[dict],
+    ) -> None:
+        """Create a thread in the dest forum and post the first message; store the thread mapping."""
         try:
-            wh = discord.Webhook.from_url(webhook_url, session=session)
+            wh = discord.Webhook.from_url(webhook_url, session=self._session)
             files: list[discord.File] = []
             extra_urls: list[str] = []
 
-            for att in attachments:
+            for att in att_records:
                 try:
                     async with _download_sem:
-                        async with session.get(att["url"]) as resp:
+                        async with self._session.get(att["url"]) as resp:
                             if resp.status == 200:
                                 data = await resp.read()
                                 if len(data) < 8 * 1024 * 1024:
@@ -812,28 +925,191 @@ async def _mirror_worker(db: aiosqlite.Connection, session: aiohttp.ClientSessio
                             else:
                                 extra_urls.append(att["url"])
                 except Exception as exc:
-                    console.warning("Mirror attachment fetch failed (%s): %s", att["filename"], exc)
+                    console.warning("Forum mirror attachment fetch failed (%s): %s", att["filename"], exc)
                     extra_urls.append(att["url"])
 
-            for s in stickers:
+            for s in stk_records:
                 extra_urls.append(f"https://media.discordapp.net/stickers/{s['id']}.webp")
 
-            post_content = content or ""
+            post_content = message.content or ""
             if extra_urls:
                 post_content = (post_content + "\n" + "\n".join(extra_urls)).strip()
 
-            await wh.send(
-                content=post_content or "\u200b",
-                username=author,
-                avatar_url=avatar_url,
-                files=files or discord.utils.MISSING,
+            sent = await wh.send(
+                content=post_content or "​",
+                username=str(message.author),
+                avatar_url=str(message.author.display_avatar.url),
+                thread_name=message.channel.name,
+                wait=True,
             )
-            console.info("Mirrored message to %s", webhook_url[:40])
+            dest_thread_id = sent.channel.id
+            await self._db.execute(
+                "INSERT OR REPLACE INTO server_mirror_channels (source_channel_id, dest_channel_id, webhook_url) VALUES (?, ?, ?)",
+                (message.channel.id, dest_thread_id, webhook_url),
+            )
+            await self._db.commit()
+            console.info("Forum mirror: created thread '%s' in dest forum", message.channel.name)
         except Exception as exc:
-            console.warning("Mirror post to %s failed: %s", webhook_url[:40], exc)
-        finally:
+            console.warning("Forum thread mirror failed for '%s': %s", message.channel.name, exc)
+
+    async def on_guild_channel_create(self, channel: discord.abc.GuildChannel) -> None:
+        if not isinstance(channel, (discord.TextChannel, discord.VoiceChannel, discord.ForumChannel)):
+            return
+        for src_id, dst_id in MIRROR_SERVERS:
+            if channel.guild.id == src_id:
+                dst_client = _guild_client.get(dst_id)
+                if dst_client:
+                    dst_guild = dst_client.get_guild(dst_id)
+                    if dst_guild:
+                        if isinstance(channel, discord.TextChannel):
+                            await _ensure_server_mirror_channel(self._db, dst_guild, channel, {})
+                        elif isinstance(channel, discord.VoiceChannel):
+                            await _ensure_server_mirror_voice_channel(self._db, dst_guild, channel, {})
+                        else:
+                            await _ensure_server_mirror_forum(self._db, dst_guild, channel, {})
+                break
+
+    async def on_error(self, event: str, *args, **kwargs) -> None:  # type: ignore[override]
+        import traceback
+        console.error("Error in %s:\n%s", event, traceback.format_exc())
+
+
+async def _mirror_webhooks_for_channel(db: aiosqlite.Connection, channel_id: int) -> list[str]:
+    """Return all webhook URLs that should receive mirror posts for channel_id."""
+    urls = list(MIRROR_MAP.get(channel_id, []))
+    async with db.execute(
+        "SELECT webhook_url FROM server_mirror_channels WHERE source_channel_id = ?",
+        (channel_id,),
+    ) as cur:
+        for row in await cur.fetchall():
+            urls.append(row[0])
+    return urls
+
+
+async def _mirror_worker(db: aiosqlite.Connection, session: aiohttp.ClientSession) -> None:
+    while True:
+        try:
+            await _mirror_worker_tick(db, session)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            console.warning("Mirror worker: unexpected error, restarting: %s", exc)
+            await asyncio.sleep(5.0)
+
+
+async def _mirror_worker_tick(db: aiosqlite.Connection, session: aiohttp.ClientSession) -> None:
+    try:
+        async with db.execute(
+            """SELECT q.id, q.message_id, q.webhook_url, q.dest_thread_id, q.reply_to,
+                      m.author, m.avatar_url, m.content, m.attachments, m.stickers
+               FROM mirror_queue q
+               JOIN messages m ON q.message_id = m.id
+               ORDER BY q.id
+               LIMIT 1"""
+        ) as cursor:
+            row = await cursor.fetchone()
+    except Exception as exc:
+        console.warning("Mirror worker: DB fetch error: %s", exc)
+        await asyncio.sleep(5.0)
+        return
+
+    if row is None:
+        try:
+            async with db.execute(
+                "SELECT id, webhook_url, content FROM mirror_notifications ORDER BY id LIMIT 1"
+            ) as cur:
+                notif = await cur.fetchone()
+        except Exception as exc:
+            console.warning("Mirror worker: DB fetch error (notifications): %s", exc)
+            await asyncio.sleep(5.0)
+            return
+        if notif is not None:
+            try:
+                wh = discord.Webhook.from_url(notif[1], session=session)
+                await wh.send(content=notif[2], username="Message Logger")
+            except Exception as exc:
+                console.warning("Mirror notification to %s failed: %s", notif[1][:40], exc)
+            finally:
+                try:
+                    await db.execute("DELETE FROM mirror_notifications WHERE id = ?", (notif[0],))
+                    await db.commit()
+                except Exception as exc:
+                    console.warning("Mirror worker: failed to delete notification %s: %s", notif[0], exc)
+            return
+        await asyncio.sleep(0.5)
+        return
+
+    queue_id, source_message_id, webhook_url, dest_thread_id, reply_to = row[0], row[1], row[2], row[3], row[4]
+    author, avatar_url, content, attachments_json, stickers_json = row[5], row[6], row[7], row[8], row[9]
+    attachments: list[dict] = json.loads(attachments_json) if attachments_json else []
+    stickers: list[dict] = json.loads(stickers_json) if stickers_json else []
+
+    try:
+        wh = discord.Webhook.from_url(webhook_url, session=session)
+        files: list[discord.File] = []
+        extra_urls: list[str] = []
+
+        for att in attachments:
+            try:
+                async with _download_sem:
+                    async with session.get(att["url"], timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                        if resp.status == 200:
+                            data = await resp.read()
+                            if len(data) < 8 * 1024 * 1024:
+                                files.append(discord.File(io.BytesIO(data), filename=att["filename"]))
+                            else:
+                                extra_urls.append(att["url"])
+                        else:
+                            extra_urls.append(att["url"])
+            except Exception as exc:
+                console.warning("Mirror attachment fetch failed (%s): %s", att["filename"], exc)
+                extra_urls.append(att["url"])
+
+        for s in stickers:
+            extra_urls.append(f"https://media.discordapp.net/stickers/{s['id']}.webp")
+
+        post_content = content or ""
+        if reply_to is not None:
+            async with db.execute(
+                "SELECT author, content FROM messages WHERE id = ?", (reply_to,)
+            ) as cur:
+                ref_row = await cur.fetchone()
+            if ref_row:
+                ref_full = ref_row[1] or ""
+                ref_preview = ref_full[:100] + ("…" if len(ref_full) > 100 else "")
+                async with db.execute(
+                    "SELECT jump_url FROM mirror_message_map WHERE source_message_id = ? AND webhook_url = ?",
+                    (reply_to, webhook_url),
+                ) as cur:
+                    jump_row = await cur.fetchone()
+                if jump_row:
+                    ref_preview += f" [↗]({jump_row[0]})"
+                post_content = f"> **{ref_row[0]}**: {ref_preview}\n{post_content}"
+        if extra_urls:
+            post_content = (post_content + "\n" + "\n".join(extra_urls)).strip()
+
+        sent = await wh.send(
+            content=post_content or "​",
+            username=author,
+            avatar_url=avatar_url,
+            files=files or discord.utils.MISSING,
+            thread=discord.Object(id=dest_thread_id) if dest_thread_id else discord.utils.MISSING,
+            wait=True,
+        )
+        await db.execute(
+            "INSERT OR IGNORE INTO mirror_message_map (source_message_id, webhook_url, jump_url) VALUES (?, ?, ?)",
+            (source_message_id, webhook_url, sent.jump_url),
+        )
+        await db.commit()
+        console.info("Mirrored message to %s", webhook_url[:40])
+    except Exception as exc:
+        console.warning("Mirror post to %s failed: %s", webhook_url[:40], exc)
+    finally:
+        try:
             await db.execute("DELETE FROM mirror_queue WHERE id = ?", (queue_id,))
             await db.commit()
+        except Exception as exc:
+            console.warning("Mirror worker: failed to delete queue item %s: %s", queue_id, exc)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -859,16 +1135,13 @@ async def main() -> None:
             avatar_url  TEXT
         )
     """)
-    # Migrate existing DBs that predate the avatar_url column.
-    try:
-        await db.execute("ALTER TABLE messages ADD COLUMN avatar_url TEXT")
-    except Exception:
-        pass
     await db.execute("""
         CREATE TABLE IF NOT EXISTS mirror_queue (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            message_id  INTEGER NOT NULL,
-            webhook_url TEXT    NOT NULL,
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id     INTEGER NOT NULL,
+            webhook_url    TEXT    NOT NULL,
+            dest_thread_id INTEGER,
+            reply_to       INTEGER,
             UNIQUE(message_id, webhook_url)
         )
     """)
@@ -879,6 +1152,48 @@ async def main() -> None:
             webhook_url        TEXT    NOT NULL
         )
     """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS server_mirror_forums (
+            source_forum_id INTEGER PRIMARY KEY,
+            dest_forum_id   INTEGER NOT NULL,
+            webhook_url     TEXT    NOT NULL
+        )
+    """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS mirror_notifications (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            webhook_url TEXT NOT NULL,
+            content     TEXT NOT NULL
+        )
+    """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS mirror_message_map (
+            source_message_id INTEGER NOT NULL,
+            webhook_url       TEXT    NOT NULL,
+            jump_url          TEXT    NOT NULL,
+            PRIMARY KEY (source_message_id, webhook_url)
+        )
+    """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS accounts (
+            user_id     INTEGER PRIMARY KEY,
+            username    TEXT    NOT NULL,
+            avatar_url  TEXT,
+            token       TEXT    NOT NULL,
+            poster_only INTEGER NOT NULL DEFAULT 0,
+            token_index INTEGER
+        )
+    """)
+    # Migrations for existing DBs
+    for migration in [
+        "ALTER TABLE messages ADD COLUMN avatar_url TEXT",
+        "ALTER TABLE mirror_queue ADD COLUMN dest_thread_id INTEGER",
+        "ALTER TABLE mirror_queue ADD COLUMN reply_to INTEGER",
+    ]:
+        try:
+            await db.execute(migration)
+        except Exception:
+            pass
     await db.commit()
 
     mirror_session = aiohttp.ClientSession()
@@ -886,13 +1201,14 @@ async def main() -> None:
         _mirror_worker(db, mirror_session), name="mirror-worker"
     )
 
-    clients: list[MessageLogger] = [MessageLogger(db) for _ in TOKENS]
+    clients: list[MessageLogger] = [MessageLogger(db, token_index=i) for i in range(len(TOKENS))]
     tokens: list[str] = list(TOKENS)
-    _total_clients = len(clients)  # count non-poster clients for ready coordination
+    _total_clients = len(clients)
     _server_mirror_ready = asyncio.Event()
     if LOG_POSTER_TOKEN:
         clients.append(MessageLogger(db, poster_only=True))
         tokens.append(LOG_POSTER_TOKEN)
+        _total_clients += 1
 
     server_mirror_setup = asyncio.create_task(_setup_server_mirrors(db), name="server-mirror-setup")
 

@@ -7,4 +7,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY logger.py .
 
-CMD ["python", "logger.py"]
+CMD ["sh", "-c", "touch cache.db && exec python logger.py"]
