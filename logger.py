@@ -74,7 +74,7 @@ _lib_handler.setFormatter(
                       "%Y-%m-%d %H:%M:%S", style="{")
 )
 logging.getLogger("discord").addHandler(_lib_handler)
-logging.getLogger("discord").setLevel(logging.WARNING)
+logging.getLogger("discord").setLevel(logging.DEBUG)
 
 console = logging.getLogger("message_logger")
 console.setLevel(logging.INFO)
@@ -409,19 +409,9 @@ async def _provision_mirror_channel_webhook(
     if not isinstance(dst_channel, discord.TextChannel):
         return
 
-    readable = isinstance(src_channel, discord.VoiceChannel) or await _probe_readable(src_channel)
+    readable = await _probe_readable(src_channel)
     if not readable:
-        unreadable_cat = discord.utils.get(dst_guild.categories, name=UNREADABLE_CATEGORY_NAME)
-        if unreadable_cat is None:
-            try:
-                unreadable_cat = await dst_guild.create_category(UNREADABLE_CATEGORY_NAME)
-            except Exception as exc:
-                console.warning("Server mirror: could not create unreadable category: %s", exc)
-        if unreadable_cat is not None:
-            try:
-                await dst_channel.edit(category=unreadable_cat)
-            except Exception as exc:
-                console.warning("Server mirror: could not move #%s to unreadable: %s", dst_channel.name, exc)
+        await _move_to_unreadable_category(dst_guild, dst_channel, category_cache)
         await db.execute(
             "UPDATE server_mirror_channels SET unreadable = 1 WHERE source_channel_id = ?",
             (src_channel.id,),
@@ -449,7 +439,9 @@ async def _provision_mirror_forum_webhook(
     db: aiosqlite.Connection,
     dst_guild: discord.Guild,
     src_forum: discord.ForumChannel,
+    category_cache: dict[str, discord.CategoryChannel] | None = None,
 ) -> None:
+    category_cache = category_cache if category_cache is not None else {}
     async with db.execute(
         "SELECT dest_forum_id, webhook_url FROM server_mirror_forums WHERE source_forum_id = ?",
         (src_forum.id,),
@@ -460,6 +452,16 @@ async def _provision_mirror_forum_webhook(
 
     dst_forum = dst_guild.get_channel(row[0])
     if not isinstance(dst_forum, discord.ForumChannel):
+        return
+
+    if not await _probe_forum_readable(src_forum):
+        await _move_to_unreadable_category(dst_guild, dst_forum, category_cache)
+        await db.execute(
+            "UPDATE server_mirror_forums SET unreadable = 1 WHERE source_forum_id = ?",
+            (src_forum.id,),
+        )
+        await db.commit()
+        console.info("Server mirror: forum #%s is unreadable, placed in '%s'", src_forum.name, UNREADABLE_CATEGORY_NAME)
         return
 
     try:
@@ -514,9 +516,52 @@ async def _clear_dest_guild(db: aiosqlite.Connection, dst_guild: discord.Guild) 
     console.info("Server mirror: cleared dest guild '%s'", dst_guild.name)
 
 
-async def _probe_readable(channel: discord.TextChannel) -> bool:
+async def _probe_readable(channel: discord.TextChannel | discord.VoiceChannel) -> bool:
     try:
         async for _ in channel.history(limit=1):
+            break
+        return True
+    except discord.Forbidden:
+        return False
+    except Exception:
+        return True  # treat transient errors as readable
+
+
+def _in_unreadable_category(dst_guild: discord.Guild, channel: discord.abc.GuildChannel) -> bool:
+    if channel.category_id is None:
+        return False
+    cat = dst_guild.get_channel(channel.category_id)
+    if not isinstance(cat, discord.CategoryChannel):
+        return False
+    return cat.name == UNREADABLE_CATEGORY_NAME or (
+        cat.name.startswith(f"{UNREADABLE_CATEGORY_NAME} (") and cat.name.endswith(")")
+    )
+
+
+async def _move_to_unreadable_category(
+    dst_guild: discord.Guild,
+    dst_channel: discord.abc.GuildChannel,
+    category_cache: dict[str, discord.CategoryChannel],
+) -> None:
+    for overflow in range(20):
+        cat = await _get_or_create_category(dst_guild, UNREADABLE_CATEGORY_NAME, overflow, category_cache)
+        if cat is None:
+            console.warning("Server mirror: could not get/create unreadable category for #%s", dst_channel.name)
+            return
+        try:
+            await dst_channel.edit(category=cat)
+            return
+        except discord.HTTPException as exc:
+            if "Maximum number of channels in category" in exc.text:
+                continue
+            console.warning("Server mirror: could not move #%s to unreadable: %s", dst_channel.name, exc)
+            return
+    console.warning("Server mirror: no unreadable category with room for #%s", dst_channel.name)
+
+
+async def _probe_forum_readable(forum: discord.ForumChannel) -> bool:
+    try:
+        async for _ in forum.archived_threads(limit=1):
             break
         return True
     except discord.Forbidden:
@@ -566,14 +611,62 @@ async def _setup_server_mirrors(db: aiosqlite.Connection) -> None:
         for channel in src_guild.voice_channels:
             await _provision_mirror_channel_webhook(db, dst_guild, channel, category_cache)
         for channel in src_guild.forums:
-            await _provision_mirror_forum_webhook(db, dst_guild, channel)
+            await _provision_mirror_forum_webhook(db, dst_guild, channel, category_cache)
 
-        unreadable_cat = discord.utils.get(dst_guild.categories, name=UNREADABLE_CATEGORY_NAME)
-        if unreadable_cat is not None:
+        # Delete dest categories that are now empty because all their channels were unreadable
+        non_cat_channels = [ch for ch in dst_guild.channels if not isinstance(ch, discord.CategoryChannel)]
+        deleted_cats = 0
+        for cat in list(dst_guild.categories):
+            if (cat.name == ARCHIVE_CATEGORY_NAME or
+                    cat.name == UNREADABLE_CATEGORY_NAME or
+                    (cat.name.startswith(f"{UNREADABLE_CATEGORY_NAME} (") and cat.name.endswith(")"))):
+                continue
+            if not any(ch.category_id == cat.id for ch in non_cat_channels):
+                try:
+                    await cat.delete()
+                    deleted_cats += 1
+                    console.info("Server mirror: deleted empty category '%s' in %s", cat.name, dst_guild.name)
+                except Exception as exc:
+                    console.warning("Server mirror: could not delete empty category '%s': %s", cat.name, exc)
+
+        # Sort all unreadable overflow categories to the bottom in numeric order
+        unreadable_cats = sorted(
+            [c for c in dst_guild.categories if
+             c.name == UNREADABLE_CATEGORY_NAME or
+             (c.name.startswith(f"{UNREADABLE_CATEGORY_NAME} (") and c.name.endswith(")"))],
+            key=lambda c: 0 if c.name == UNREADABLE_CATEGORY_NAME
+            else int(c.name[len(UNREADABLE_CATEGORY_NAME) + 2:-1]),
+        )
+        total_cats = len(dst_guild.categories)
+        for i, cat in enumerate(unreadable_cats):
             try:
-                await unreadable_cat.edit(position=len(dst_guild.categories) - 1)
+                await cat.edit(position=total_cats - len(unreadable_cats) + i)
             except Exception as exc:
-                console.warning("Server mirror: could not move '%s' to bottom: %s", UNREADABLE_CATEGORY_NAME, exc)
+                console.warning("Server mirror: could not reposition '%s': %s", cat.name, exc)
+
+        async with db.execute(
+            "SELECT unreadable, COUNT(*) FROM server_mirror_channels GROUP BY unreadable"
+        ) as cur:
+            ch_counts = {row[0]: row[1] for row in await cur.fetchall()}
+        async with db.execute(
+            "SELECT unreadable, COUNT(*) FROM server_mirror_forums GROUP BY unreadable"
+        ) as cur:
+            fr_counts = {row[0]: row[1] for row in await cur.fetchall()}
+
+        ch_readable   = ch_counts.get(0, 0)
+        ch_unreadable = ch_counts.get(1, 0)
+        fr_readable   = fr_counts.get(0, 0)
+        fr_unreadable = fr_counts.get(1, 0)
+
+        summary = "\n".join([
+            f"✅ Mirror setup complete: **{src_guild.name}** → **{dst_guild.name}**",
+            f"Channels: {ch_readable} mirrored, {ch_unreadable} unreadable",
+            f"Forums:   {fr_readable} mirrored, {fr_unreadable} unreadable",
+            f"Deleted {deleted_cats} fully-unreadable empty categories",
+        ])
+        console.info("Server mirror: setup complete for %s → %s (%d ch mirrored, %d unreadable, %d forums mirrored, %d unreadable, %d empty cats deleted)",
+                     src_guild.name, dst_guild.name, ch_readable, ch_unreadable, fr_readable, fr_unreadable, deleted_cats)
+        await _post_queue.put((summary, []))
 
 
 ARCHIVE_CATEGORY_NAME = "📁 Archived"
@@ -606,12 +699,11 @@ async def _archive_sync_worker(db: aiosqlite.Connection) -> None:
             ) as cur:
                 channel_rows = await cur.fetchall()
             async with db.execute(
-                "SELECT source_forum_id, dest_forum_id FROM server_mirror_forums"
+                "SELECT source_forum_id, dest_forum_id, unreadable FROM server_mirror_forums"
             ) as cur:
                 forum_rows = await cur.fetchall()
 
             dst_archive_cat: discord.CategoryChannel | None = None
-            dst_unreadable_cat: discord.CategoryChannel | None = None
 
             async def get_archive_cat() -> discord.CategoryChannel | None:
                 nonlocal dst_archive_cat
@@ -625,24 +717,6 @@ async def _archive_sync_worker(db: aiosqlite.Connection) -> None:
                     except Exception as exc:
                         console.warning("Archive sync: could not create archive category: %s", exc)
                 return dst_archive_cat
-
-            async def get_unreadable_cat() -> discord.CategoryChannel | None:
-                nonlocal dst_unreadable_cat
-                if dst_unreadable_cat is not None:
-                    return dst_unreadable_cat
-                dst_unreadable_cat = discord.utils.get(dst_guild.categories, name=UNREADABLE_CATEGORY_NAME)
-                if dst_unreadable_cat is None:
-                    try:
-                        dst_unreadable_cat = await dst_guild.create_category(UNREADABLE_CATEGORY_NAME)
-                        console.info("Archive sync: created '%s' in %s", UNREADABLE_CATEGORY_NAME, dst_guild.name)
-                    except Exception as exc:
-                        console.warning("Archive sync: could not create unreadable category: %s", exc)
-                if dst_unreadable_cat is not None:
-                    try:
-                        await dst_unreadable_cat.edit(position=len(dst_guild.categories) - 1)
-                    except Exception as exc:
-                        console.warning("Archive sync: could not move '%s' to bottom: %s", UNREADABLE_CATEGORY_NAME, exc)
-                return dst_unreadable_cat
 
             category_cache: dict[str, discord.CategoryChannel] = {}
 
@@ -695,11 +769,10 @@ async def _archive_sync_worker(db: aiosqlite.Connection) -> None:
                         except Exception as exc:
                             console.warning("Archive sync: could not create webhook for #%s: %s", dst_ch.name, exc)
                     else:
-                        # Still unreadable — ensure it's in the unreadable category
-                        unreadable_cat = await get_unreadable_cat()
-                        if unreadable_cat is not None and dst_ch.category_id != unreadable_cat.id:
+                        # Still unreadable — ensure it's in an unreadable category
+                        if not _in_unreadable_category(dst_guild, dst_ch):
                             try:
-                                await dst_ch.edit(category=unreadable_cat)
+                                await _move_to_unreadable_category(dst_guild, dst_ch, category_cache)
                                 console.info(
                                     "Archive sync: moved #%s to '%s' in %s",
                                     dst_ch.name, UNREADABLE_CATEGORY_NAME, dst_guild.name,
@@ -723,7 +796,7 @@ async def _archive_sync_worker(db: aiosqlite.Connection) -> None:
                         console.warning("Archive sync: could not unarchive #%s: %s", dst_ch.name, exc)
 
             for row in forum_rows:
-                src_id, dst_id = row[0], row[1]
+                src_id, dst_id, is_unreadable = row[0], row[1], row[2]
                 src_ch = src_guild.get_channel(src_id)
                 dst_ch = dst_guild.get_channel(dst_id)
                 if dst_ch is None:
@@ -738,6 +811,46 @@ async def _archive_sync_worker(db: aiosqlite.Connection) -> None:
                         console.info("Archive sync: archived forum #%s in %s (source gone)", dst_ch.name, dst_guild.name)
                     except Exception as exc:
                         console.warning("Archive sync: could not archive forum #%s: %s", dst_ch.name, exc)
+                elif is_unreadable:
+                    now_readable = await _probe_forum_readable(src_ch)
+                    if now_readable:
+                        target_cat = (
+                            await _get_or_create_category(dst_guild, src_ch.category.name, 0, category_cache)
+                            if src_ch.category else None
+                        )
+                        try:
+                            await dst_ch.edit(category=target_cat)
+                            cat_name = target_cat.name if target_cat else "no category"
+                            console.info(
+                                "Archive sync: forum #%s became readable, moved to '%s' in %s",
+                                dst_ch.name, cat_name, dst_guild.name,
+                            )
+                        except Exception as exc:
+                            console.warning("Archive sync: could not move newly-readable forum #%s: %s", dst_ch.name, exc)
+                            continue
+                        try:
+                            existing_wh = await dst_ch.webhooks()
+                            wh = discord.utils.get(existing_wh, name="MessageMirror")
+                            if wh is None:
+                                wh = await dst_ch.create_webhook(name="MessageMirror")
+                            await db.execute(
+                                "UPDATE server_mirror_forums SET unreadable = 0, webhook_url = ? WHERE source_forum_id = ?",
+                                (wh.url, src_id),
+                            )
+                            await db.commit()
+                            console.info("Archive sync: created webhook for newly-readable forum #%s", dst_ch.name)
+                        except Exception as exc:
+                            console.warning("Archive sync: could not create webhook for forum #%s: %s", dst_ch.name, exc)
+                    else:
+                        if not _in_unreadable_category(dst_guild, dst_ch):
+                            try:
+                                await _move_to_unreadable_category(dst_guild, dst_ch, category_cache)
+                                console.info(
+                                    "Archive sync: moved forum #%s to '%s' in %s",
+                                    dst_ch.name, UNREADABLE_CATEGORY_NAME, dst_guild.name,
+                                )
+                            except Exception as exc:
+                                console.warning("Archive sync: could not move unreadable forum #%s: %s", dst_ch.name, exc)
                 else:
                     archive_cat = await get_archive_cat()
                     if archive_cat is None or dst_ch.category_id != archive_cat.id:
@@ -980,7 +1093,7 @@ class MessageLogger(discord.Client):
                 (message.channel.id,),
             ) as cur:
                 row = await cur.fetchone()
-            if row:
+            if row and row[0] is not None:
                 dest_thread_id = row[1] if isinstance(message.channel, discord.Thread) else None
                 await self._db.execute(
                     "INSERT OR IGNORE INTO mirror_queue (message_id, webhook_url, dest_thread_id, reply_to) VALUES (?, ?, ?, ?)",
@@ -1482,6 +1595,16 @@ async def main() -> None:
     worker = asyncio.create_task(_post_worker(), name="log-poster")
     db = await aiosqlite.connect("data/cache.db")
     await db.execute("PRAGMA journal_mode=WAL")
+
+    # Drop server mirror tables if they were created with webhook_url NOT NULL
+    # (the two-pass setup requires NULL during Pass 1; these tables are always rebuilt on startup)
+    for _tbl in ("server_mirror_channels", "server_mirror_forums"):
+        async with db.execute(f"PRAGMA table_info({_tbl})") as _cur:
+            _cols = {row[1]: row for row in await _cur.fetchall()}
+        if _cols.get("webhook_url", (None, None, None, 0))[3]:  # notnull == 1
+            await db.execute(f"DROP TABLE {_tbl}")
+    await db.commit()
+
     await db.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id          INTEGER PRIMARY KEY,
@@ -1510,7 +1633,7 @@ async def main() -> None:
         CREATE TABLE IF NOT EXISTS server_mirror_channels (
             source_channel_id  INTEGER PRIMARY KEY,
             dest_channel_id    INTEGER NOT NULL,
-            webhook_url        TEXT    NOT NULL,
+            webhook_url        TEXT,
             unreadable         INTEGER NOT NULL DEFAULT 0
         )
     """)
@@ -1518,7 +1641,8 @@ async def main() -> None:
         CREATE TABLE IF NOT EXISTS server_mirror_forums (
             source_forum_id INTEGER PRIMARY KEY,
             dest_forum_id   INTEGER NOT NULL,
-            webhook_url     TEXT    NOT NULL
+            webhook_url     TEXT,
+            unreadable      INTEGER NOT NULL DEFAULT 0
         )
     """)
     await db.execute("""
@@ -1552,6 +1676,7 @@ async def main() -> None:
         "ALTER TABLE mirror_queue ADD COLUMN dest_thread_id INTEGER",
         "ALTER TABLE mirror_queue ADD COLUMN reply_to INTEGER",
         "ALTER TABLE server_mirror_channels ADD COLUMN unreadable INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE server_mirror_forums ADD COLUMN unreadable INTEGER NOT NULL DEFAULT 0",
     ]:
         try:
             await db.execute(migration)
