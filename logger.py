@@ -227,6 +227,14 @@ async def _get_or_create_category(
         return existing
     try:
         cat = await dst_guild.create_category(name)
+        if overflow > 0:
+            prev_name = base_name if overflow == 1 else f"{base_name} ({overflow})"
+            prev_cat = category_cache.get(prev_name)
+            if prev_cat is not None:
+                try:
+                    await cat.edit(position=prev_cat.position + 1)
+                except Exception as exc:
+                    console.warning("Server mirror: could not reorder category '%s': %s", name, exc)
         category_cache[name] = cat
         console.info("Server mirror: created category '%s' in %s", name, dst_guild.name)
         return cat
