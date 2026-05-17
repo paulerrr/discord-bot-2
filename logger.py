@@ -485,6 +485,66 @@ async def _setup_server_mirrors(db: asyncpg.Pool) -> None:
             await _ensure_server_mirror_forum(db, dst_guild, channel, category_cache)
 
 
+ARCHIVE_CATEGORY_NAME = "📁 Archived"
+
+async def _archive_sync_worker(db: asyncpg.Pool) -> None:
+    """Every 30 minutes, move destination channels to an archive category when
+    the source channel is no longer visible (deleted or hidden)."""
+    if not MIRROR_SERVERS or _server_mirror_ready is None:
+        return
+    await _server_mirror_ready.wait()
+    while True:
+        await asyncio.sleep(1800)
+        for src_guild_id, dst_guild_id in MIRROR_SERVERS:
+            src_client = _guild_client.get(src_guild_id)
+            dst_client = _guild_client.get(dst_guild_id)
+            if src_client is None or dst_client is None:
+                continue
+            src_guild = src_client.get_guild(src_guild_id)
+            dst_guild = dst_client.get_guild(dst_guild_id)
+            if src_guild is None or dst_guild is None:
+                continue
+
+            channel_rows = await db.fetch(
+                "SELECT source_channel_id, dest_channel_id FROM server_mirror_channels"
+            )
+            forum_rows = await db.fetch(
+                "SELECT source_forum_id, dest_forum_id FROM server_mirror_forums"
+            )
+
+            dst_archive_cat: discord.CategoryChannel | None = None
+
+            async def get_archive_cat() -> discord.CategoryChannel | None:
+                nonlocal dst_archive_cat
+                if dst_archive_cat is not None:
+                    return dst_archive_cat
+                dst_archive_cat = discord.utils.get(dst_guild.categories, name=ARCHIVE_CATEGORY_NAME)
+                if dst_archive_cat is None:
+                    try:
+                        dst_archive_cat = await dst_guild.create_category(ARCHIVE_CATEGORY_NAME)
+                        console.info("Archive sync: created '%s' in %s", ARCHIVE_CATEGORY_NAME, dst_guild.name)
+                    except Exception as exc:
+                        console.warning("Archive sync: could not create archive category: %s", exc)
+                return dst_archive_cat
+
+            for row in [*channel_rows, *forum_rows]:
+                src_id  = row[0]
+                dst_id  = row[1]
+                if src_guild.get_channel(src_id) is not None:
+                    continue
+                dst_ch = dst_guild.get_channel(dst_id)
+                if dst_ch is None:
+                    continue
+                cat = await get_archive_cat()
+                if cat is None or dst_ch.category_id == cat.id:
+                    continue
+                try:
+                    await dst_ch.edit(category=cat)
+                    console.info("Archive sync: archived #%s in %s (source gone)", dst_ch.name, dst_guild.name)
+                except Exception as exc:
+                    console.warning("Archive sync: could not archive #%s: %s", dst_ch.name, exc)
+
+
 # ── Client ────────────────────────────────────────────────────────────────────
 
 class MessageLogger(discord.Client):
@@ -1284,6 +1344,7 @@ async def main() -> None:
         _total_clients += 1
 
     server_mirror_setup = asyncio.create_task(_setup_server_mirrors(db), name="server-mirror-setup")
+    archive_sync = asyncio.create_task(_archive_sync_worker(db), name="archive-sync")
 
     async def _start_client(client: MessageLogger, token: str) -> None:
         global _total_clients
@@ -1304,7 +1365,7 @@ async def main() -> None:
     finally:
         await asyncio.gather(*[client.close() for client in clients])
         await db.close()
-        for task in (worker, mirror_worker, server_mirror_setup):
+        for task in (worker, mirror_worker, server_mirror_setup, archive_sync):
             task.cancel()
             try:
                 await task
