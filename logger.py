@@ -212,6 +212,29 @@ async def _save_sticker(session: aiohttp.ClientSession,
 
 # ── Server mirror helpers ─────────────────────────────────────────────────────
 
+async def _get_or_create_category(
+    dst_guild: discord.Guild,
+    base_name: str,
+    overflow: int,
+    category_cache: dict[str, discord.CategoryChannel],
+) -> discord.CategoryChannel | None:
+    name = base_name if overflow == 0 else f"{base_name} ({overflow + 1})"
+    if name in category_cache:
+        return category_cache[name]
+    existing = discord.utils.get(dst_guild.categories, name=name)
+    if existing is not None:
+        category_cache[name] = existing
+        return existing
+    try:
+        cat = await dst_guild.create_category(name)
+        category_cache[name] = cat
+        console.info("Server mirror: created category '%s' in %s", name, dst_guild.name)
+        return cat
+    except Exception as exc:
+        console.warning("Server mirror: could not create category '%s': %s", name, exc)
+        return None
+
+
 async def _ensure_server_mirror_channel(
     db: aiosqlite.Connection,
     dst_guild: discord.Guild,
@@ -227,25 +250,32 @@ async def _ensure_server_mirror_channel(
 
     dst_channel = discord.utils.get(dst_guild.text_channels, name=src_channel.name)
     if dst_channel is None:
-        dst_category: discord.CategoryChannel | None = None
-        if src_channel.category:
-            dst_category = category_cache.get(src_channel.category.name) or discord.utils.get(dst_guild.categories, name=src_channel.category.name)
-            if dst_category is None:
-                try:
-                    dst_category = await dst_guild.create_category(src_channel.category.name)
-                    category_cache[src_channel.category.name] = dst_category
-                    console.info("Server mirror: created category '%s' in %s", src_channel.category.name, dst_guild.name)
-                except Exception as exc:
-                    console.warning("Server mirror: could not create category '%s': %s", src_channel.category.name, exc)
-        try:
-            dst_channel = await dst_guild.create_text_channel(
-                src_channel.name,
-                category=dst_category,
-                topic=src_channel.topic or "",
+        base_cat_name = src_channel.category.name if src_channel.category else None
+        for overflow in range(20):
+            dst_category: discord.CategoryChannel | None = (
+                await _get_or_create_category(dst_guild, base_cat_name, overflow, category_cache)
+                if base_cat_name else None
             )
-            console.info("Server mirror: created channel #%s in %s", src_channel.name, dst_guild.name)
-        except Exception as exc:
-            console.warning("Server mirror: could not create channel #%s: %s", src_channel.name, exc)
+            if base_cat_name and dst_category is None:
+                return
+            try:
+                dst_channel = await dst_guild.create_text_channel(
+                    src_channel.name,
+                    category=dst_category,
+                    topic=src_channel.topic or "",
+                )
+                console.info("Server mirror: created channel #%s in %s", src_channel.name, dst_guild.name)
+                break
+            except discord.HTTPException as exc:
+                if base_cat_name and "Maximum number of channels in category" in exc.text:
+                    continue
+                console.warning("Server mirror: could not create channel #%s: %s", src_channel.name, exc)
+                return
+            except Exception as exc:
+                console.warning("Server mirror: could not create channel #%s: %s", src_channel.name, exc)
+                return
+        else:
+            console.warning("Server mirror: no category with room for #%s, giving up", src_channel.name)
             return
 
     try:
@@ -280,21 +310,28 @@ async def _ensure_server_mirror_voice_channel(
 
     dst_channel = discord.utils.get(dst_guild.text_channels, name=src_channel.name)
     if dst_channel is None:
-        dst_category: discord.CategoryChannel | None = None
-        if src_channel.category:
-            dst_category = category_cache.get(src_channel.category.name) or discord.utils.get(dst_guild.categories, name=src_channel.category.name)
-            if dst_category is None:
-                try:
-                    dst_category = await dst_guild.create_category(src_channel.category.name)
-                    category_cache[src_channel.category.name] = dst_category
-                    console.info("Server mirror: created category '%s' in %s", src_channel.category.name, dst_guild.name)
-                except Exception as exc:
-                    console.warning("Server mirror: could not create category '%s': %s", src_channel.category.name, exc)
-        try:
-            dst_channel = await dst_guild.create_text_channel(src_channel.name, category=dst_category)
-            console.info("Server mirror: created text channel #%s (from voice) in %s", src_channel.name, dst_guild.name)
-        except Exception as exc:
-            console.warning("Server mirror: could not create voice channel #%s: %s", src_channel.name, exc)
+        base_cat_name = src_channel.category.name if src_channel.category else None
+        for overflow in range(20):
+            dst_category: discord.CategoryChannel | None = (
+                await _get_or_create_category(dst_guild, base_cat_name, overflow, category_cache)
+                if base_cat_name else None
+            )
+            if base_cat_name and dst_category is None:
+                return
+            try:
+                dst_channel = await dst_guild.create_text_channel(src_channel.name, category=dst_category)
+                console.info("Server mirror: created text channel #%s (from voice) in %s", src_channel.name, dst_guild.name)
+                break
+            except discord.HTTPException as exc:
+                if base_cat_name and "Maximum number of channels in category" in exc.text:
+                    continue
+                console.warning("Server mirror: could not create voice channel #%s: %s", src_channel.name, exc)
+                return
+            except Exception as exc:
+                console.warning("Server mirror: could not create voice channel #%s: %s", src_channel.name, exc)
+                return
+        else:
+            console.warning("Server mirror: no category with room for #%s (voice), giving up", src_channel.name)
             return
 
     try:
@@ -329,25 +366,32 @@ async def _ensure_server_mirror_forum(
 
     dst_forum = discord.utils.get(dst_guild.forums, name=src_forum.name)
     if dst_forum is None:
-        dst_category: discord.CategoryChannel | None = None
-        if src_forum.category:
-            dst_category = category_cache.get(src_forum.category.name) or discord.utils.get(dst_guild.categories, name=src_forum.category.name)
-            if dst_category is None:
-                try:
-                    dst_category = await dst_guild.create_category(src_forum.category.name)
-                    category_cache[src_forum.category.name] = dst_category
-                    console.info("Server mirror: created category '%s' in %s", src_forum.category.name, dst_guild.name)
-                except Exception as exc:
-                    console.warning("Server mirror: could not create category '%s': %s", src_forum.category.name, exc)
-        try:
-            dst_forum = await dst_guild.create_forum(
-                src_forum.name,
-                category=dst_category,
-                topic=src_forum.topic or "",
+        base_cat_name = src_forum.category.name if src_forum.category else None
+        for overflow in range(20):
+            dst_category: discord.CategoryChannel | None = (
+                await _get_or_create_category(dst_guild, base_cat_name, overflow, category_cache)
+                if base_cat_name else None
             )
-            console.info("Server mirror: created forum #%s in %s", src_forum.name, dst_guild.name)
-        except Exception as exc:
-            console.warning("Server mirror: could not create forum #%s: %s", src_forum.name, exc)
+            if base_cat_name and dst_category is None:
+                return
+            try:
+                dst_forum = await dst_guild.create_forum(
+                    src_forum.name,
+                    category=dst_category,
+                    topic=src_forum.topic or "",
+                )
+                console.info("Server mirror: created forum #%s in %s", src_forum.name, dst_guild.name)
+                break
+            except discord.HTTPException as exc:
+                if base_cat_name and "Maximum number of channels in category" in exc.text:
+                    continue
+                console.warning("Server mirror: could not create forum #%s: %s", src_forum.name, exc)
+                return
+            except Exception as exc:
+                console.warning("Server mirror: could not create forum #%s: %s", src_forum.name, exc)
+                return
+        else:
+            console.warning("Server mirror: no category with room for forum #%s, giving up", src_forum.name)
             return
 
     try:
@@ -395,6 +439,85 @@ async def _setup_server_mirrors(db: aiosqlite.Connection) -> None:
             await _ensure_server_mirror_voice_channel(db, dst_guild, channel, category_cache)
         for channel in src_guild.forums:
             await _ensure_server_mirror_forum(db, dst_guild, channel, category_cache)
+
+
+ARCHIVE_CATEGORY_NAME = "📁 Archived"
+
+async def _archive_sync_worker(db: aiosqlite.Connection) -> None:
+    """Every 30 minutes, move destination channels to an archive category when
+    the source channel is no longer visible (deleted or hidden), and unarchive
+    them if the source comes back."""
+    if not MIRROR_SERVERS or _server_mirror_ready is None:
+        return
+    await _server_mirror_ready.wait()
+    while True:
+        await asyncio.sleep(1800)
+        for src_guild_id, dst_guild_id in MIRROR_SERVERS:
+            src_client = _guild_client.get(src_guild_id)
+            dst_client = _guild_client.get(dst_guild_id)
+            if src_client is None or dst_client is None:
+                continue
+            src_guild = src_client.get_guild(src_guild_id)
+            dst_guild = dst_client.get_guild(dst_guild_id)
+            if src_guild is None or dst_guild is None:
+                continue
+
+            async with db.execute(
+                "SELECT source_channel_id, dest_channel_id FROM server_mirror_channels"
+            ) as cur:
+                channel_rows = await cur.fetchall()
+            async with db.execute(
+                "SELECT source_forum_id, dest_forum_id FROM server_mirror_forums"
+            ) as cur:
+                forum_rows = await cur.fetchall()
+
+            dst_archive_cat: discord.CategoryChannel | None = None
+
+            async def get_archive_cat() -> discord.CategoryChannel | None:
+                nonlocal dst_archive_cat
+                if dst_archive_cat is not None:
+                    return dst_archive_cat
+                dst_archive_cat = discord.utils.get(dst_guild.categories, name=ARCHIVE_CATEGORY_NAME)
+                if dst_archive_cat is None:
+                    try:
+                        dst_archive_cat = await dst_guild.create_category(ARCHIVE_CATEGORY_NAME)
+                        console.info("Archive sync: created '%s' in %s", ARCHIVE_CATEGORY_NAME, dst_guild.name)
+                    except Exception as exc:
+                        console.warning("Archive sync: could not create archive category: %s", exc)
+                return dst_archive_cat
+
+            category_cache: dict[str, discord.CategoryChannel] = {}
+
+            for row in [*channel_rows, *forum_rows]:
+                src_id, dst_id = row[0], row[1]
+                src_ch = src_guild.get_channel(src_id)
+                dst_ch = dst_guild.get_channel(dst_id)
+                if dst_ch is None:
+                    continue
+
+                if src_ch is None:
+                    cat = await get_archive_cat()
+                    if cat is None or dst_ch.category_id == cat.id:
+                        continue
+                    try:
+                        await dst_ch.edit(category=cat)
+                        console.info("Archive sync: archived #%s in %s (source gone)", dst_ch.name, dst_guild.name)
+                    except Exception as exc:
+                        console.warning("Archive sync: could not archive #%s: %s", dst_ch.name, exc)
+                else:
+                    archive_cat = await get_archive_cat()
+                    if archive_cat is None or dst_ch.category_id != archive_cat.id:
+                        continue
+                    target_cat = (
+                        await _get_or_create_category(dst_guild, src_ch.category.name, 0, category_cache)
+                        if src_ch.category else None
+                    )
+                    try:
+                        await dst_ch.edit(category=target_cat)
+                        cat_name = target_cat.name if target_cat else "no category"
+                        console.info("Archive sync: unarchived #%s → '%s' in %s", dst_ch.name, cat_name, dst_guild.name)
+                    except Exception as exc:
+                        console.warning("Archive sync: could not unarchive #%s: %s", dst_ch.name, exc)
 
 
 # ── Client ────────────────────────────────────────────────────────────────────
@@ -1211,16 +1334,28 @@ async def main() -> None:
         _total_clients += 1
 
     server_mirror_setup = asyncio.create_task(_setup_server_mirrors(db), name="server-mirror-setup")
+    archive_sync = asyncio.create_task(_archive_sync_worker(db), name="archive-sync")
+
+    async def _start_client(client: MessageLogger, token: str) -> None:
+        global _total_clients
+        try:
+            await client.start(token)
+        except (discord.LoginFailure, discord.HTTPException) as exc:
+            label = "poster" if client._poster_only else f"token[{client._token_index}]"
+            console.error("%s: login failed, skipping: %s", label, exc)
+            _total_clients -= 1
+            if _server_mirror_ready is not None and _ready_count >= _total_clients:
+                _server_mirror_ready.set()
 
     try:
         await asyncio.gather(*[
-            client.start(token)
+            _start_client(client, token)
             for client, token in zip(clients, tokens)
         ])
     finally:
         await asyncio.gather(*[client.close() for client in clients])
         await db.close()
-        for task in (worker, mirror_worker, server_mirror_setup):
+        for task in (worker, mirror_worker, server_mirror_setup, archive_sync):
             task.cancel()
             try:
                 await task
