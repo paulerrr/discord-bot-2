@@ -6,4 +6,4 @@ services:
     volumes:
       - ./logs:/app/logs
       - ./media:/app/media
-      - ./cache.db:/app/cache.db
+      - ./data:/app/data

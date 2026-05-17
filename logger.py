@@ -1392,7 +1392,7 @@ async def main() -> None:
     console.info("Starting %d account(s)", len(TOKENS))
 
     worker = asyncio.create_task(_post_worker(), name="log-poster")
-    db = await aiosqlite.connect("cache.db")
+    db = await aiosqlite.connect("data/cache.db")
     await db.execute("PRAGMA journal_mode=WAL")
     await db.execute("""
         CREATE TABLE IF NOT EXISTS messages (
