@@ -294,19 +294,22 @@ async def _ensure_server_mirror_channel(
             console.warning("Server mirror: no category with room for #%s, giving up", src_channel.name)
             return
 
-    try:
-        webhooks = await dst_channel.webhooks()
-        wh = discord.utils.get(webhooks, name="MessageMirror")
-        if wh is None:
-            wh = await dst_channel.create_webhook(name="MessageMirror")
+    webhook_url: str | None = None
+    if readable:
+        try:
+            webhooks = await dst_channel.webhooks()
+            wh = discord.utils.get(webhooks, name="MessageMirror")
+            if wh is None:
+                wh = await dst_channel.create_webhook(name="MessageMirror")
             console.info("Server mirror: created webhook in #%s (%s)", dst_channel.name, dst_guild.name)
-    except Exception as exc:
-        console.warning("Server mirror: could not create webhook in #%s: %s", dst_channel.name, exc)
-        return
+            webhook_url = wh.url
+        except Exception as exc:
+            console.warning("Server mirror: could not create webhook in #%s: %s", dst_channel.name, exc)
+            return
 
     await db.execute(
         "INSERT OR REPLACE INTO server_mirror_channels (source_channel_id, dest_channel_id, webhook_url, unreadable) VALUES (?, ?, ?, ?)",
-        (src_channel.id, dst_channel.id, wh.url, 0 if readable else 1),
+        (src_channel.id, dst_channel.id, webhook_url, 0 if readable else 1),
     )
     await db.commit()
 
@@ -609,11 +612,6 @@ async def _archive_sync_worker(db: aiosqlite.Connection) -> None:
                         )
                         try:
                             await dst_ch.edit(category=target_cat)
-                            await db.execute(
-                                "UPDATE server_mirror_channels SET unreadable = 0 WHERE source_channel_id = ?",
-                                (src_id,),
-                            )
-                            await db.commit()
                             cat_name = target_cat.name if target_cat else "no category"
                             console.info(
                                 "Archive sync: #%s became readable, moved to '%s' in %s",
@@ -621,6 +619,20 @@ async def _archive_sync_worker(db: aiosqlite.Connection) -> None:
                             )
                         except Exception as exc:
                             console.warning("Archive sync: could not move newly-readable #%s: %s", dst_ch.name, exc)
+                            continue
+                        try:
+                            existing_wh = await dst_ch.webhooks()
+                            wh = discord.utils.get(existing_wh, name="MessageMirror")
+                            if wh is None:
+                                wh = await dst_ch.create_webhook(name="MessageMirror")
+                            await db.execute(
+                                "UPDATE server_mirror_channels SET unreadable = 0, webhook_url = ? WHERE source_channel_id = ?",
+                                (wh.url, src_id),
+                            )
+                            await db.commit()
+                            console.info("Archive sync: created webhook for newly-readable #%s", dst_ch.name)
+                        except Exception as exc:
+                            console.warning("Archive sync: could not create webhook for #%s: %s", dst_ch.name, exc)
                     else:
                         # Still unreadable — ensure it's in the unreadable category
                         unreadable_cat = await get_unreadable_cat()
@@ -1266,7 +1278,8 @@ async def _mirror_webhooks_for_channel(db: aiosqlite.Connection, channel_id: int
         (channel_id,),
     ) as cur:
         for row in await cur.fetchall():
-            urls.append(row[0])
+            if row[0] is not None:
+                urls.append(row[0])
     return urls
 
 
