@@ -527,22 +527,40 @@ async def _archive_sync_worker(db: asyncpg.Pool) -> None:
                         console.warning("Archive sync: could not create archive category: %s", exc)
                 return dst_archive_cat
 
+            category_cache: dict[str, discord.CategoryChannel] = {}
+
             for row in [*channel_rows, *forum_rows]:
-                src_id  = row[0]
-                dst_id  = row[1]
-                if src_guild.get_channel(src_id) is not None:
-                    continue
+                src_id = row[0]
+                dst_id = row[1]
+                src_ch = src_guild.get_channel(src_id)
                 dst_ch = dst_guild.get_channel(dst_id)
                 if dst_ch is None:
                     continue
-                cat = await get_archive_cat()
-                if cat is None or dst_ch.category_id == cat.id:
-                    continue
-                try:
-                    await dst_ch.edit(category=cat)
-                    console.info("Archive sync: archived #%s in %s (source gone)", dst_ch.name, dst_guild.name)
-                except Exception as exc:
-                    console.warning("Archive sync: could not archive #%s: %s", dst_ch.name, exc)
+
+                if src_ch is None:
+                    # Source gone — move to archive
+                    cat = await get_archive_cat()
+                    if cat is None or dst_ch.category_id == cat.id:
+                        continue
+                    try:
+                        await dst_ch.edit(category=cat)
+                        console.info("Archive sync: archived #%s in %s (source gone)", dst_ch.name, dst_guild.name)
+                    except Exception as exc:
+                        console.warning("Archive sync: could not archive #%s: %s", dst_ch.name, exc)
+                else:
+                    # Source visible — unarchive if needed
+                    archive_cat = await get_archive_cat()
+                    if archive_cat is None or dst_ch.category_id != archive_cat.id:
+                        continue
+                    target_cat = await _get_or_create_category(
+                        dst_guild, src_ch.category.name, 0, category_cache,
+                    ) if src_ch.category else None
+                    try:
+                        await dst_ch.edit(category=target_cat)
+                        cat_name = target_cat.name if target_cat else "no category"
+                        console.info("Archive sync: unarchived #%s → '%s' in %s", dst_ch.name, cat_name, dst_guild.name)
+                    except Exception as exc:
+                        console.warning("Archive sync: could not unarchive #%s: %s", dst_ch.name, exc)
 
 
 # ── Client ────────────────────────────────────────────────────────────────────
