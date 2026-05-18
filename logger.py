@@ -966,6 +966,76 @@ class MessageLogger(discord.Client):
             stickers=json.loads(row[8]) if row[8] else [],
         )
 
+    async def _log_missed_delete(self, cached: CachedMessage, guild: discord.Guild) -> None:
+        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        guild_dir = MEDIA_DIR / str(guild.id)
+        channel_label = f"#{cached.channel}" if cached.guild_name else f"DM:{cached.channel}"
+        path = _log_path(cached.guild_name, cached.channel, date)
+
+        lines: list[str] = [
+            f"[{_format_ts(datetime.now(timezone.utc))}] "
+            f"[DELETE-MISSED] {cached.author} ({cached.author_id}) "
+            f"in {channel_label}\n"
+            f"  Originally sent: {_format_ts(cached.created_at)}\n",
+            f"  Content: {cached.content}\n" if cached.content else "  Content: <unknown>\n",
+        ]
+        if cached.attachments:
+            lines.append(f"  Attachments ({len(cached.attachments)}):\n")
+            for att in cached.attachments:
+                local = _att_path(att, guild_dir, cached.id)
+                label = str(local.relative_to(MEDIA_DIR)) if local.exists() else att["url"]
+                lines.append(f"    - {att['filename']}  →  {label}\n")
+        if cached.stickers:
+            lines.append(f"  Stickers ({len(cached.stickers)}):\n")
+            for s in cached.stickers:
+                lines.append(f"    - {s['name']} (id: {s['id']}, format: {s['format']})\n")
+        lines.append("\n")
+        _write(path, "".join(lines))
+
+        files = [
+            discord.File(p)
+            for att in cached.attachments
+            if (p := _att_path(att, guild_dir, cached.id)).exists()
+        ]
+        sent_ts = int(cached.created_at.timestamp())
+        post_lines = [
+            f"🗑️ Message Deleted (missed while offline)",
+            f"Channel: {channel_label}" + (f"  ·  {cached.guild_name}" if cached.guild_name else ""),
+            f"Author: {discord.utils.escape_markdown(cached.author)} ({cached.author_id})",
+            f"Sent: <t:{sent_ts}:R>",
+            f"Content: {discord.utils.escape_markdown(cached.content) if cached.content else '<no text>'}",
+        ]
+        await self._log_to_channel("\n".join(post_lines), files=files)
+        await self._db.execute("DELETE FROM messages WHERE id = ?", (cached.id,))
+        await self._db.commit()
+        console.info("Missed delete: %s in %s", cached.author, channel_label)
+
+    async def _check_missed_deletes_guild(self, guild: discord.Guild) -> None:
+        """After reconnect, compare DB cache against live history to catch offline deletes."""
+        for channel in guild.text_channels:
+            try:
+                live_ids: set[int] = set()
+                async for msg in channel.history(limit=50):
+                    live_ids.add(msg.id)
+                if not live_ids:
+                    await asyncio.sleep(0.5)
+                    continue
+                min_id = min(live_ids)
+                async with self._db.execute(
+                    "SELECT id FROM messages WHERE id >= ? AND guild_name = ? AND channel = ?",
+                    (min_id, guild.name, str(channel)),
+                ) as cur:
+                    db_ids = {row[0] for row in await cur.fetchall()}
+                for msg_id in db_ids - live_ids:
+                    cached = await self._pop_cached(msg_id)
+                    if cached is not None:
+                        await self._log_missed_delete(cached, guild)
+            except discord.Forbidden:
+                pass
+            except Exception as exc:
+                console.warning("Missed delete check failed for #%s: %s", channel.name, exc)
+            await asyncio.sleep(0.5)
+
     # ── Events ────────────────────────────────────────────────────────────────
 
     async def _send_chunked(self, text: str, files: list[discord.File]) -> None:
@@ -1037,6 +1107,12 @@ class MessageLogger(discord.Client):
                 _log_poster = self
                 self._log_channel = ch
                 console.info("Log channel: #%s (%s) (poster: %s)", ch.name, ch.id, self.user)
+        for guild in self.guilds:
+            if _guild_owner.get(guild.id) == id(self):
+                asyncio.create_task(
+                    self._check_missed_deletes_guild(guild),
+                    name=f"missed-deletes-{guild.id}",
+                )
         _ready_count += 1
         if _server_mirror_ready is not None and _ready_count >= _total_clients:
             _server_mirror_ready.set()
@@ -1460,6 +1536,50 @@ class MessageLogger(discord.Client):
                             await _ensure_server_mirror_forum(self._db, dst_guild, channel, {})
                             await _provision_mirror_forum_webhook(self._db, dst_guild, channel)
                 break
+
+    async def on_thread_create(self, thread: discord.Thread) -> None:
+        if not isinstance(thread.parent, discord.TextChannel):
+            return  # forum threads handled in on_message
+        if not self._is_watched_guild(thread.guild.id):
+            return
+        for src_id, dst_id in MIRROR_SERVERS:
+            if thread.guild.id != src_id:
+                continue
+            async with self._db.execute(
+                "SELECT webhook_url, dest_channel_id FROM server_mirror_channels WHERE source_channel_id = ?",
+                (thread.parent_id,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None or row[0] is None:
+                return
+            webhook_url, dest_parent_id = row[0], row[1]
+            dst_client = _guild_client.get(dst_id)
+            if dst_client is None:
+                return
+            dst_guild = dst_client.get_guild(dst_id)
+            if dst_guild is None:
+                return
+            dst_channel = dst_guild.get_channel(dest_parent_id)
+            if not isinstance(dst_channel, discord.TextChannel):
+                return
+            try:
+                dst_thread = await dst_channel.create_thread(
+                    name=thread.name,
+                    type=discord.ChannelType.public_thread,
+                )
+                await self._db.execute(
+                    "INSERT OR REPLACE INTO server_mirror_channels "
+                    "(source_channel_id, dest_channel_id, webhook_url, unreadable) VALUES (?, ?, ?, ?)",
+                    (thread.id, dst_thread.id, webhook_url, 0),
+                )
+                await self._db.commit()
+                console.info(
+                    "Thread mirror: created thread '%s' in #%s (%s)",
+                    thread.name, dst_channel.name, dst_guild.name,
+                )
+            except Exception as exc:
+                console.warning("Thread mirror: could not create thread '%s': %s", thread.name, exc)
+            break
 
     async def on_error(self, event: str, *args, **kwargs) -> None:  # type: ignore[override]
         import traceback
